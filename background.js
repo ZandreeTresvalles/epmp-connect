@@ -32,6 +32,34 @@ const PLATFORM_COOKIE_DOMAINS = {
 
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// ── Dashboard auto-detection ─────────────────────────────────────────────────
+// Predecessor extensions deliberately required a manual "Capture Session"
+// click because multi-step 2FA makes auto-detecting "login complete"
+// unreliable. This trades that safety margin for a hands-off flow: a false
+// positive just fails harmlessly ("No cookies found"), and the banner's
+// manual button stays available as a fallback if auto-detection never fires.
+// Patterns mirror the post-login warm-up URLs each backend's own scraper
+// already treats as "logged in" (see e.g. encoder-reports_2's shopeeApi.ts /
+// lazadaApi.ts / tiktokApi.ts warm-up + login-redirect checks).
+const DASHBOARD_PATTERNS = {
+  LAZADA: (u) => /(^|\.)sellercenter\.lazada\.com\.ph$/.test(u.hostname)
+    && !/\/(login|signin)/i.test(u.pathname),
+  SHOPEE: (u) => /(^|\.)seller\.shopee\.ph$/.test(u.hostname)
+    && /\/(portal\/sale\/order|datacenter)/i.test(u.pathname),
+  TIKTOK: (u) => /(^|\.)seller(-ph)?\.tiktok\.com$/.test(u.hostname)
+    && /\/(compass\/data-overview|order)/i.test(u.pathname)
+    && !/\/account\/login/i.test(u.pathname),
+};
+
+function looksLikeDashboard(platform, urlStr) {
+  try {
+    const check = DASHBOARD_PATTERNS[platform];
+    return !!check && check(new URL(urlStr));
+  } catch {
+    return false;
+  }
+}
+
 // ── Upload URL normalization ─────────────────────────────────────────────────
 // Callers give us one of: a bare origin (https://host), a base ending in /api,
 // or a full upload URL. Normalize all to {origin}/api/v1/automation/sessions.
@@ -253,11 +281,26 @@ async function startCapture(payload) {
   return { ok: true, started: true, tabId: tab.id };
 }
 
-// Re-inject the banner whenever a tab that has a capture context finishes loading.
-chrome.tabs.onUpdated.addListener(async (tabId, info) => {
+// Re-inject the banner, and attempt auto-capture, whenever a tracked tab
+// finishes loading. Auto-capture is best-effort and one-shot per tab: on
+// success captureFromTab() already clears the context (so it won't refire);
+// on failure we mark it attempted and leave the banner as the manual fallback
+// rather than retrying indefinitely on every subsequent 'complete' event.
+chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
   if (info.status !== 'complete') return;
   const ctx = await getContext(tabId);
-  if (ctx) injectBanner(tabId, ctx.platform);
+  if (!ctx) return;
+
+  injectBanner(tabId, ctx.platform);
+
+  if (!ctx.autoCaptureAttempted && looksLikeDashboard(ctx.platform, tab.url || '')) {
+    const result = await captureFromTab(tabId).catch((e) => ({ ok: false, error: String(e?.message || e) }));
+    if (!result.ok) {
+      // Leave the context (and banner) in place so the operator can still
+      // capture manually; just stop auto-retrying on this tab.
+      await setContext(tabId, { ...ctx, autoCaptureAttempted: true });
+    }
+  }
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => { clearContext(tabId); });
