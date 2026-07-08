@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>EPMP Connect</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      width: 380px;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-size: 13px;
+      background: #0f0f10;
+      color: #e4e4e7;
+    }
+
+    .header {
+      display: flex; align-items: center; gap: 10px;
+      padding: 14px 16px 12px;
+      border-bottom: 1px solid #27272a;
+    }
+    .header-icon {
+      width: 28px; height: 28px;
+      background: linear-gradient(135deg, #06b6d4, #3b82f6);
+      border-radius: 8px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 14px;
+    }
+    .header-title { font-size: 14px; font-weight: 600; color: #fff; }
+    .header-sub   { font-size: 11px; color: #71717a; margin-top: 1px; }
+
+    .body { padding: 14px 16px; display: flex; flex-direction: column; gap: 12px; }
+
+    .platform-badge {
+      display: flex; align-items: center; gap: 8px;
+      padding: 8px 12px; border-radius: 8px; font-size: 12px; border: 1px solid;
+    }
+    .platform-badge.detected   { background: rgba(16,185,129,.08); border-color: rgba(16,185,129,.25); color: #34d399; }
+    .platform-badge.undetected { background: rgba(250,204,21,.06); border-color: rgba(250,204,21,.2);  color: #fbbf24; }
+    .platform-badge.error-state{ background: rgba(239,68,68,.06);  border-color: rgba(239,68,68,.2);   color: #f87171; }
+    .platform-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; flex-shrink: 0; }
+
+    .field { display: flex; flex-direction: column; gap: 4px; }
+    .label {
+      font-size: 11px; font-weight: 500; color: #a1a1aa;
+      text-transform: uppercase; letter-spacing: 0.04em;
+    }
+    .input {
+      background: #18181b; border: 1px solid #3f3f46; border-radius: 8px;
+      padding: 8px 10px; color: #e4e4e7; font-size: 12px;
+      font-family: 'SF Mono', 'Fira Code', monospace; outline: none;
+      transition: border-color 0.15s; width: 100%;
+    }
+    .input:focus { border-color: #06b6d4; }
+    .input::placeholder { color: #52525b; }
+
+    .btn-capture {
+      width: 100%; padding: 10px; background: #06b6d4; color: #fff;
+      border: none; border-radius: 8px; font-size: 13px; font-weight: 600;
+      cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 6px;
+      transition: background 0.15s, opacity 0.15s;
+    }
+    .btn-capture:hover:not(:disabled) { background: #0891b2; }
+    .btn-capture:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    .status { display: none; padding: 8px 12px; border-radius: 8px; font-size: 12px; border: 1px solid; }
+    .status.show    { display: flex; align-items: flex-start; gap: 7px; }
+    .status.loading { background: rgba(6,182,212,.06);  border-color: rgba(6,182,212,.2);  color: #22d3ee; }
+    .status.success { background: rgba(16,185,129,.08); border-color: rgba(16,185,129,.25); color: #34d399; }
+    .status.error   { background: rgba(239,68,68,.06);  border-color: rgba(239,68,68,.2);   color: #f87171; }
+    .status-icon { flex-shrink: 0; margin-top: 1px; }
+
+    .settings-toggle {
+      display: flex; align-items: center; gap: 5px; background: none; border: none;
+      color: #52525b; font-size: 11px; cursor: pointer; padding: 0; transition: color 0.15s;
+    }
+    .settings-toggle:hover { color: #a1a1aa; }
+    .settings-panel { display: none; }
+    .settings-panel.open { display: flex; flex-direction: column; gap: 8px; }
+
+    .divider { height: 1px; background: #27272a; margin: 0 -16px; }
+
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .spinner {
+      width: 13px; height: 13px; border: 2px solid rgba(255,255,255,0.3);
+      border-top-color: #fff; border-radius: 50%; animation: spin 0.7s linear infinite;
+    }
+    .hint { font-size: 11px; color: #71717a; line-height: 1.5; }
+    .hint a { color: #22d3ee; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="header-icon">⚡</div>
+    <div>
+      <div class="header-title">EPMP Connect</div>
+      <div class="header-sub">Shared Seller Center session capture</div>
+    </div>
+  </div>
+
+  <div class="body">
+    <div id="platformBadge" class="platform-badge undetected">
+      <div class="platform-dot"></div>
+      <span id="platformText">Detecting platform…</span>
+    </div>
+
+    <div class="field">
+      <label class="label" for="tokenInput">One-Time Capture Token</label>
+      <input id="tokenInput" class="input" type="text"
+             placeholder="Paste token from the Sessions page…"
+             autocomplete="off" spellcheck="false" />
+    </div>
+
+    <button id="captureBtn" class="btn-capture">
+      <span id="captureBtnIcon">⚡</span>
+      <span id="captureBtnText">Capture Session</span>
+    </button>
+
+    <div id="statusMsg" class="status">
+      <span class="status-icon" id="statusIcon"></span>
+      <span id="statusText"></span>
+    </div>
+
+    <p class="hint">
+      Tip: most apps have an in-page <b>Authenticate</b> / <b>Connect</b> button that
+      captures automatically — this popup is the manual fallback.
+    </p>
+
+    <div class="divider"></div>
+
+    <button class="settings-toggle" id="settingsToggle"><span>⚙</span> Settings</button>
+    <div class="settings-panel" id="settingsPanel">
+      <div class="field">
+        <label class="label" for="apiUrlInput">Backend API URL</label>
+        <input id="apiUrlInput" class="input" type="url"
+               placeholder="https://your-backend.example.com"
+               autocomplete="off" spellcheck="false" />
+      </div>
+      <p class="hint">
+        Your project's backend base URL (with or without <code>/api</code>). Saved
+        locally on this machine. Ask your admin if unsure.
+      </p>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

@@ -1,0 +1,54 @@
+{
+  "manifest_version": 3,
+  "name": "EPMP Connect",
+  "version": "2.0.0",
+  "description": "Captures authenticated Shopee, Lazada, and TikTok Seller Center sessions for EPMP / ReportBot / Audit automation. One shared capture extension for every project.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtxfUfIV+6rhnNxesSDb9tPOp7QJiguIZvn6ZInfNwHRjbDdpYMeNE2dmWPew3hs/fD57v7E8Nm+EXS0efDmWDlGpte9bBsM4NWBYSYfjgank9ccXPAH5x6b22wTi8k+5pqr4qU8Lps6x4fpC/ijIw0k5QmLD4eLSaxbdhPNiIlq0CX+Id6zk5L8egb2D9AO9qKOYLACiPvXS0r7Kg5D3Kji+t2sdWoYsiO+G4JWfKGhWf2+6MiQrIWoyKZqObX05Tjn/RToMkn74Zufr6mrjN6E1OXOkyszPnctgtNkpI+1Ftd7Wtu+h2J4La9uWP5Ww5uQttROFovYa+oK4+frLXQIDAQAB",
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "EPMP Connect"
+  },
+  "permissions": [
+    "cookies",
+    "storage",
+    "scripting",
+    "tabs",
+    "activeTab"
+  ],
+  "host_permissions": [
+    "*://*.shopee.ph/*",
+    "*://*.shopee.com/*",
+    "*://*.lazada.com.ph/*",
+    "*://*.lazada.com/*",
+    "*://*.tiktok.com/*",
+    "*://*.tiktokshop.com/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://epmp-orpin.vercel.app/*",
+        "https://cloudecomm-encoder-reports-automation.vercel.app/*",
+        "https://cloudecomm-audit-reports-automation.vercel.app/*",
+        "http://localhost:3000/*",
+        "http://localhost:3001/*",
+        "http://localhost:39003/*"
+      ],
+      "js": ["bridge.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "*://seller.shopee.ph/*",
+        "*://sellercenter.lazada.com.ph/*",
+        "*://seller.tiktok.com/*",
+        "*://seller-ph.tiktok.com/*"
+      ],
+      "js": ["interceptor.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    }
+  ]
+}
