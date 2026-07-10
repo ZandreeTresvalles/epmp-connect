@@ -142,5 +142,9 @@ Broad registrable domains (matched with all subdomains):
 
 ## Versioning
 
+`2.1.0` — automated capturing: the bridge flow now auto-captures when the tab
+lands on a known Seller Center dashboard URL (one attempt per tab; the banner's
+manual **Capture Session** button remains as fallback).
+
 `2.0.0` — first unified release (merge of audit-reports, encoder-reports, and
 epmp capture extensions).
