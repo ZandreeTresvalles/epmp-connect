@@ -60,10 +60,32 @@ window.__epmpConnectShowBanner = function (platform) {
         setStatus(`✅ Captured ${res.cookieCount} cookies${res.endpointDiscovered ? ' + catalog' : ''}. You can close this tab.`);
         btn.textContent = 'Done';
         setTimeout(() => { try { window.close(); } catch { /* ignore */ } }, 2500);
+      } else if (res?.error === 'No capture context for this tab') {
+        // Most likely cause: an earlier auto-capture on this tab already
+        // succeeded and cleared the context (see markBannerCaptured in
+        // background.js, which should normally beat us to this state —
+        // this is the fallback if that update didn't land in time).
+        btn.disabled = true;
+        btn.textContent = 'Done';
+        setStatus('✅ Already captured for this tab. Reopen the capture flow if you need to re-capture.');
       } else {
         btn.disabled = false;
         setStatus('❌ ' + (res?.error || 'Capture failed'));
       }
     });
   });
+};
+
+// Called by background.js right after a one-shot auto-capture succeeds, so the
+// banner reflects reality instead of leaving a "Capture Session" button that
+// would otherwise fail with a confusing "no capture context" error if clicked.
+window.__epmpConnectMarkCaptured = function (result) {
+  const bar = document.getElementById('__epmp_connect_bar__');
+  if (!bar) return;
+  const statusEl = bar.querySelector('#__epmp_status__');
+  const btn = bar.querySelector('#__epmp_capture_btn__');
+  if (statusEl) {
+    statusEl.textContent = `✅ Captured ${result?.cookieCount ?? ''} cookies automatically. You can close this tab.`;
+  }
+  if (btn) { btn.disabled = true; btn.textContent = 'Done'; }
 };

@@ -42,11 +42,16 @@ const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 // already treats as "logged in" (see e.g. encoder-reports_2's shopeeApi.ts /
 // lazadaApi.ts / tiktokApi.ts warm-up + login-redirect checks).
 const DASHBOARD_PATTERNS = {
+  // Excludes not just /login|signin but the known intermediate auth screens
+  // (OTP/2FA, shop selection, SSO/callback) that also live on sellercenter.*
+  // and can carry a few partial-auth cookies before the operator is actually
+  // logged in — matching one of those here would auto-capture a dead session
+  // and clear the capture context out from under the still-visible banner.
   LAZADA: (u) => /(^|\.)sellercenter\.lazada\.com\.ph$/.test(u.hostname)
-    && !/\/(login|signin)/i.test(u.pathname),
+    && !/\/(login|signin|otp|verify|mfa|2fa|captcha|sso|callback|oauth|select-shop|shop-selection|account\/select)/i.test(u.pathname),
   SHOPEE: (u) => /(^|\.)seller\.shopee\.ph$/.test(u.hostname)
     && /\/(portal\/sale\/order|datacenter)/i.test(u.pathname),
-  TIKTOK: (u) => /(^|\.)seller(-ph)?\.tiktok\.com$/.test(u.hostname)
+  TIKTOK: (u) => /(^|\.)seller-ph\.tiktok\.com$/.test(u.hostname)
     && /\/(compass\/data-overview|order)/i.test(u.pathname)
     && !/\/account\/login/i.test(u.pathname),
 };
@@ -295,13 +300,29 @@ chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
 
   if (!ctx.autoCaptureAttempted && looksLikeDashboard(ctx.platform, tab.url || '')) {
     const result = await captureFromTab(tabId).catch((e) => ({ ok: false, error: String(e?.message || e) }));
-    if (!result.ok) {
+    if (result.ok) {
+      // Context is already cleared by captureFromTab(). Update the banner so
+      // its "Capture Session" button doesn't sit there looking clickable —
+      // otherwise a later manual click fails with a confusing "no context"
+      // error even though the session was already captured.
+      markBannerCaptured(tabId, result);
+    } else {
       // Leave the context (and banner) in place so the operator can still
       // capture manually; just stop auto-retrying on this tab.
       await setContext(tabId, { ...ctx, autoCaptureAttempted: true });
     }
   }
 });
+
+async function markBannerCaptured(tabId, result) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: (info) => window.__epmpConnectMarkCaptured && window.__epmpConnectMarkCaptured(info),
+      args: [result],
+    });
+  } catch { /* tab may have navigated away already; nothing to update */ }
+}
 
 chrome.tabs.onRemoved.addListener((tabId) => { clearContext(tabId); });
 
