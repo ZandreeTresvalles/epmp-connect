@@ -20,8 +20,13 @@ Two capture flows, one upload contract:
 
 1. **In-app flow (recommended).** A project's web app has an **Authenticate** /
    **Connect** button. Clicking it asks the extension (via the page bridge) to
-   open the platform login tab and show a capture banner. After the operator
-   logs in, they click **Capture Session** in the banner.
+   open the platform login tab and show a capture banner. Once the operator logs
+   in and the tab lands on an authenticated Seller Center dashboard, the
+   extension **auto-captures** the session (one attempt per tab). The banner's
+   **Capture Session** button remains as a manual fallback. Login itself is never
+   automated — the human logs in with their own 2FA; auto-detection only decides
+   *when* to read the resulting session, and login/2FA pages are excluded so it
+   never fires mid-login.
 2. **Popup flow (manual fallback).** Open the Seller Center tab, click the
    extension toolbar icon, paste the one-time token, and capture the active tab.
 
@@ -141,6 +146,14 @@ Broad registrable domains (matched with all subdomains):
 - **TikTok:** `tiktok.com`, `tiktokshop.com`
 
 ## Versioning
+
+`2.1.1` — auto-capture reliability: dashboard detection is now host-based (any
+authenticated Seller Center page that isn't a login/2FA page) across all three
+platforms instead of one hard-coded path, so it fires regardless of which page a
+seller lands on after login; retries once on the cookie-settle race; and adds an
+`autoCaptureInFlight` re-entrancy guard so product-endpoint discovery's own tab
+navigation can't trigger a second concurrent capture. Manual **Capture Session**
+button unchanged as fallback.
 
 `2.1.0` — automated capturing: the bridge flow now auto-captures when the tab
 lands on a known Seller Center dashboard URL (one attempt per tab; the banner's

@@ -3,10 +3,11 @@
  *
  * The background worker injects this file into the platform login tab, then
  * calls window.__epmpConnectShowBanner(platform). The operator logs in normally
- * (real browser, real IP, their own 2FA) and clicks "Capture Session" when they
- * reach the dashboard. We do NOT auto-detect login — multi-step 2FA makes that
- * unreliable; a human click is 100% accurate. The click asks the background
- * worker to read cookies + localStorage and upload.
+ * (real browser, real IP, their own 2FA). background.js auto-captures once the
+ * tab lands on an authenticated Seller Center dashboard URL; this banner's
+ * "Capture Session" button is the always-available manual fallback (and covers
+ * any account whose landing page auto-detection misses). Either path asks the
+ * background worker to read cookies + localStorage and upload.
  */
 
 window.__epmpConnectShowBanner = function (platform) {

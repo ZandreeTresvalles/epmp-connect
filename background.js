@@ -38,17 +38,32 @@ const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 // unreliable. This trades that safety margin for a hands-off flow: a false
 // positive just fails harmlessly ("No cookies found"), and the banner's
 // manual button stays available as a fallback if auto-detection never fires.
-// Patterns mirror the post-login warm-up URLs each backend's own scraper
-// already treats as "logged in" (see e.g. encoder-reports_2's shopeeApi.ts /
-// lazadaApi.ts / tiktokApi.ts warm-up + login-redirect checks).
+//
+// Detection doctrine (mirrors what each backend's own scraper treats as
+// "logged in"): a seller lands authenticated on the Seller Center HOST but the
+// post-login landing PATH varies per account (Shopee → /portal/home,
+// /portal/sale/order, /datacenter/…; TikTok → /order, /compass/*, /homepage,
+// etc.). The scrapers therefore never match a specific dashboard path — they
+// treat the session as valid whenever the URL is on the seller-center host and
+// is NOT a login/auth page. We use the same test here so auto-capture fires on
+// ANY authenticated landing page, not just one hand-picked route.
+//   - encoder-reports shopeeApi.ts: logged-in ⇔ url.startsWith('https://seller.shopee.ph')
+//   - encoder-reports tiktok.ts / tiktokApi.ts: logged-out ⇔ url includes
+//     /account/login | /passport/ | /sign-in | login
+//   - encoder-reports lazadaApi.ts / lazada.ts: logged-out ⇔ url includes /login | /signin
+//   - audit-reports shopeeInventory.ts / tiktokInventory.ts: logged-out ⇔ url
+//     includes /login | /sign-in | /passport
+// AUTH_PATH is the union of those login/2FA/verification path fragments; a URL
+// that matches it is treated as "still logging in" and auto-capture is held off.
+const AUTH_PATH = /(\/(login|signin|sign-in|passport|account\/login|verify|verification|2fa|otp|captcha))/i;
+
 const DASHBOARD_PATTERNS = {
   LAZADA: (u) => /(^|\.)sellercenter\.lazada\.com\.ph$/.test(u.hostname)
-    && !/\/(login|signin)/i.test(u.pathname),
+    && !AUTH_PATH.test(u.pathname),
   SHOPEE: (u) => /(^|\.)seller\.shopee\.ph$/.test(u.hostname)
-    && /\/(portal\/sale\/order|datacenter)/i.test(u.pathname),
+    && !AUTH_PATH.test(u.pathname),
   TIKTOK: (u) => /(^|\.)seller(-ph)?\.tiktok\.com$/.test(u.hostname)
-    && /\/(compass\/data-overview|order)/i.test(u.pathname)
-    && !/\/account\/login/i.test(u.pathname),
+    && !AUTH_PATH.test(u.pathname),
 };
 
 function looksLikeDashboard(platform, urlStr) {
@@ -286,6 +301,32 @@ async function startCapture(payload) {
 // success captureFromTab() already clears the context (so it won't refire);
 // on failure we mark it attempted and leave the banner as the manual fallback
 // rather than retrying indefinitely on every subsequent 'complete' event.
+//
+// Re-entrancy guard (autoCaptureInFlight): a single auto-capture can itself
+// trigger more 'complete' events on the SAME tab — when ctx.productListUrl is
+// set (epmp), captureFromTab() runs runDiscovery(), which navigates the tab to
+// the product-list URL and polls for up to 30s. That product-list URL is an
+// authenticated, non-login page, so it MATCHES the (host-based) dashboard
+// patterns and the resulting 'complete' would otherwise start a SECOND
+// concurrent captureFromTab() — double-uploading the single-use token (the 2nd
+// upload 401s "already used") and racing two navigations on one tab. We set an
+// in-flight flag before awaiting the capture and bail on any re-entrant event
+// while it's set. (This is broader than skipping discovery on the auto path,
+// which we deliberately do NOT do: discovery is the whole point of the epmp
+// bridge flow, and it must keep working when auto-capture is the trigger.)
+//
+// "No cookies found" is the one recoverable failure: the tab reached the
+// dashboard URL a beat before the platform finished writing its session
+// cookies. We give the cookies a short settle window and retry once before
+// giving up — this converts a race-condition miss into a successful hands-off
+// capture without widening the trigger or dropping the one-shot guarantee. The
+// retry is within this same handler invocation, so the in-flight guard already
+// covers it. Any other error (bad token, unsupported platform, upload HTTP
+// failure) is not retried; we mark the tab attempted and fall back to the
+// manual banner button.
+const AUTO_CAPTURE_SETTLE_MS = 1500;
+const NO_COOKIES_RE = /no cookies found/i;
+
 chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
   if (info.status !== 'complete') return;
   const ctx = await getContext(tabId);
@@ -293,13 +334,33 @@ chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
 
   injectBanner(tabId, ctx.platform);
 
-  if (!ctx.autoCaptureAttempted && looksLikeDashboard(ctx.platform, tab.url || '')) {
-    const result = await captureFromTab(tabId).catch((e) => ({ ok: false, error: String(e?.message || e) }));
-    if (!result.ok) {
-      // Leave the context (and banner) in place so the operator can still
-      // capture manually; just stop auto-retrying on this tab.
-      await setContext(tabId, { ...ctx, autoCaptureAttempted: true });
+  // Bail if already attempted (one-shot), already running (re-entrancy from a
+  // discovery navigation), or this isn't an authenticated dashboard URL.
+  if (ctx.autoCaptureAttempted || ctx.autoCaptureInFlight
+      || !looksLikeDashboard(ctx.platform, tab.url || '')) return;
+
+  // Claim the in-flight slot BEFORE any await, so the next 'complete' event that
+  // discovery's own navigation fires reads the flag and bails.
+  await setContext(tabId, { ...ctx, autoCaptureInFlight: true });
+
+  let result = await captureFromTab(tabId).catch((e) => ({ ok: false, error: String(e?.message || e) }));
+
+  // One retry, only for the cookie-settle race — and only if the context is
+  // still present (a concurrent success/tab-close would have cleared it).
+  if (!result.ok && NO_COOKIES_RE.test(result.error || '')) {
+    await delay(AUTO_CAPTURE_SETTLE_MS);
+    if (await getContext(tabId)) {
+      result = await captureFromTab(tabId).catch((e) => ({ ok: false, error: String(e?.message || e) }));
     }
+  }
+
+  // On success captureFromTab() already cleared the context, so nothing to do.
+  // On failure, clear the in-flight flag and mark the tab attempted so it won't
+  // refire — but leave the context (and banner) in place for the manual
+  // fallback. Guard the write: if the context was cleared meanwhile (late
+  // success / tab close), don't recreate it.
+  if (!result.ok && (await getContext(tabId))) {
+    await setContext(tabId, { ...ctx, autoCaptureInFlight: false, autoCaptureAttempted: true });
   }
 });
 
