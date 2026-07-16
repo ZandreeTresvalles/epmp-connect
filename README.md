@@ -27,8 +27,11 @@ Two capture flows, one upload contract:
    automated — the human logs in with their own 2FA; auto-detection only decides
    *when* to read the resulting session, and login/2FA pages are excluded so it
    never fires mid-login.
-2. **Popup flow (manual fallback).** Open the Seller Center tab, click the
-   extension toolbar icon, paste the one-time token, and capture the active tab.
+2. **Popup flow (manual-retry fallback).** If auto-capture doesn't fire or needs to
+   be retried, open the Seller Center tab, click the extension toolbar icon, and
+   click **Capture Session**. The popup will use the capture context stored by the
+   in-app flow, or show a helpful error prompting you to start via EPMP's
+   **Authenticate** button.
 
 Both read cookies (`chrome.cookies`) + `localStorage` (`chrome.scripting`),
 build a Playwright `storageState`, and POST it with the one-time token.
@@ -146,6 +149,19 @@ Broad registrable domains (matched with all subdomains):
 - **TikTok:** `tiktok.com`, `tiktokshop.com`
 
 ## Versioning
+
+`2.2.0` — capture feedback and simplified popup UX: the banner now shows explicit
+success, notice, and error states (persistent green checkmark + brand name on
+success; non-fatal notices on auto-capture failure; no silent closes). The popup's
+manual **Capture Session** button no longer requires pasting a one-time token —
+it now uses the capture context stored by the in-app **Authenticate** flow when
+available, falling back to a helpful error message if needed. Backward compatible:
+explicit tokens are still accepted for ReportBot dialect and other backends.
+Also hardens product-list discovery (`interceptor.js`): a discovered endpoint must
+now return *hydrated* rows (carrying a product name), not just an array of objects,
+so an id-only prefetch endpoint can no longer win discovery over the real catalog
+endpoint (e.g. Shopee `search_product_list`) — the cause of brands syncing back
+nameless "Unnamed product" rows.
 
 `2.1.1` — auto-capture reliability: dashboard detection is now host-based (any
 authenticated Seller Center page that isn't a login/2FA page) across all three

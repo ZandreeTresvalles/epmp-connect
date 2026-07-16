@@ -43,9 +43,11 @@ capture engine. The other files are thin edges that talk to it.
    stores a per-tab context → `onUpdated` injects `banner.js` → operator logs in and
    clicks **Capture Session** → `captureFromTab()` reads cookies + localStorage and
    uploads.
-2. **Popup flow** (manual fallback): operator opens the Seller Center tab, opens the
-   toolbar popup (`popup.html`/`popup.js`), pastes the token → `CAPTURE_ACTIVE_TAB`
-   → same `captureFromTab()`.
+2. **Popup flow** (manual-retry fallback): if auto-capture doesn't fire or needs to be
+   retried, operator opens the Seller Center tab, opens the toolbar popup
+   (`popup.html`/`popup.js`), clicks **Capture Session** → `CAPTURE_ACTIVE_TAB` → handler
+   falls back to `getContext(tabId)` (the context stored by the bridge flow) or shows a
+   helpful error if neither context nor explicit token is available → same `captureFromTab()`.
 
 **Dual-dialect contract — the central design constraint.** So no frontend had to
 change when the three extensions merged, both `background.js` and `bridge.js` speak
@@ -68,7 +70,10 @@ change when the three extensions merged, both `background.js` and `bridge.js` sp
 - `interceptor.js` — MAIN world, `document_start`, on Seller Center hosts. It
   monkey-patches `fetch`/`XHR` to passively record product-list API responses into
   `window.__epmpProductCapture`. Purely best-effort telemetry for EPMP's optional
-  catalog-endpoint discovery — it must never disturb the page.
+  catalog-endpoint discovery — it must never disturb the page. **Only *hydrated*
+  responses (entries carrying a product name) are marked `preferred`/bubbled to the
+  front**; an id-only prefetch endpoint must never win discovery over the real
+  hydrated catalog endpoint (else the backend replays it and gets nameless rows).
 
 **Upload contract** (all backends agree): `POST {origin}/api/v1/automation/sessions`
 with `Authorization: Bearer <one-time-token>` and body `{ storageState, ...optional }`.
@@ -81,9 +86,11 @@ so it survives service-worker restarts; it's cleared on capture success or tab c
 ## Conventions & gotchas
 
 - **No baked-in backend URL** — this is a public repo. The popup requires the
-  operator to enter the backend base URL once (saved to `chrome.storage.local`); the
-  bridge flow gets the URL from the calling web app. Never hard-code an environment
-  hostname.
+  operator to enter the backend base URL once (saved to `chrome.storage.local`) when
+  retrying; the bridge flow gets the URL from the calling web app. The popup's
+  **Capture Session** button uses the capture context stored by the bridge flow when
+  available, or prompts the operator to use EPMP's **Authenticate** flow. Never
+  hard-code an environment hostname.
 - **Cookie collection is by broad registrable domain** (`PLATFORM_COOKIE_DOMAINS`),
   not per-host: `chrome.cookies.getAll({domain})` matches all subdomains, so
   `seller.*`, `accounts.*`, `sellercenter.*` are covered without listing each. To

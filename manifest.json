@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "EPMP Connect",
-  "version": "2.1.1",
+  "version": "2.2.0",
   "description": "Captures authenticated Shopee, Lazada, and TikTok Seller Center sessions for EPMP / ReportBot / Audit automation. One shared capture extension for every project.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtxfUfIV+6rhnNxesSDb9tPOp7QJiguIZvn6ZInfNwHRjbDdpYMeNE2dmWPew3hs/fD57v7E8Nm+EXS0efDmWDlGpte9bBsM4NWBYSYfjgank9ccXPAH5x6b22wTi8k+5pqr4qU8Lps6x4fpC/ijIw0k5QmLD4eLSaxbdhPNiIlq0CX+Id6zk5L8egb2D9AO9qKOYLACiPvXS0r7Kg5D3Kji+t2sdWoYsiO+G4JWfKGhWf2+6MiQrIWoyKZqObX05Tjn/RToMkn74Zufr6mrjN6E1OXOkyszPnctgtNkpI+1Ftd7Wtu+h2J4La9uWP5Ww5uQttROFovYa+oK4+frLXQIDAQAB",
   "background": {
