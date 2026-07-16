@@ -184,6 +184,34 @@ async function injectBanner(tabId, platform) {
   } catch { /* tab may not be ready; onUpdated will retry */ }
 }
 
+// ── Banner state helpers (success / notice / error feedback) ────────────────
+// Every terminal capture outcome — success, or a failure the operator needs to
+// know about — pushes an explicit state into the banner (see banner.js) so a
+// capture never resolves in silence. Best-effort throughout: a banner-push
+// failure (tab closed/navigated away mid-capture, etc.) must never affect the
+// capture result itself, so every caller treats this as fire-and-forget.
+const PLATFORM_LABELS = { SHOPEE: 'Shopee', LAZADA: 'Lazada', TIKTOK: 'TikTok' };
+
+function captureLabel(ctx) {
+  const platform = ctx && ctx.platform;
+  return (ctx && ctx.brandName) || PLATFORM_LABELS[platform] || platform || 'Seller Center';
+}
+
+function successMessage(ctx) {
+  return `Session captured for ${captureLabel(ctx)} — EPMP is connected. You can close this tab.`;
+}
+
+async function showBannerState(tabId, platform, state, message) {
+  try {
+    await chrome.scripting.executeScript({ target: { tabId }, files: ['banner.js'] });
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: (p, s, m) => window.__epmpConnectShowBanner && window.__epmpConnectShowBanner(p, { state: s, message: m }),
+      args: [platform || '', state, message || ''],
+    });
+  } catch { /* tab may be gone/navigated away — feedback is best-effort */ }
+}
+
 // ── Product-list discovery (epmp) ────────────────────────────────────────────
 // interceptor.js (MAIN world) records product-list responses into
 // window.__epmpProductCapture. We navigate to productListUrl, poll for a hit,
@@ -270,7 +298,12 @@ async function captureFromTab(tabId, ctxOverride) {
 
   await uploadSession(uploadUrl, ctx.token, body);
   await clearContext(tabId);
-  return { ok: true, cookieCount: storageState.cookies.length, endpointDiscovered };
+  return {
+    ok: true,
+    cookieCount: storageState.cookies.length,
+    endpointDiscovered,
+    label: captureLabel(ctx),
+  };
 }
 
 // ── Start a bridge-initiated capture (open login tab + banner) ───────────────
@@ -354,13 +387,28 @@ chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
     }
   }
 
-  // On success captureFromTab() already cleared the context, so nothing to do.
+  // On success, push a persistent green confirmation into the banner. Before
+  // this, captureFromTab() clearing the context was the ONLY visible effect of
+  // a successful auto-capture — nothing rendered any feedback, so a banner
+  // wiped by an SPA re-render (or simply nobody looking at that instant) reads
+  // as the tab silently closing/vanishing with no confirmation. This is the
+  // fix for that "sometimes it closes by itself" report.
   // On failure, clear the in-flight flag and mark the tab attempted so it won't
   // refire — but leave the context (and banner) in place for the manual
-  // fallback. Guard the write: if the context was cleared meanwhile (late
-  // success / tab close), don't recreate it.
-  if (!result.ok && (await getContext(tabId))) {
+  // fallback, and surface a non-fatal notice explaining why auto-capture
+  // didn't finish instead of leaving the default prompt with no explanation.
+  // Guard the write: if the context was cleared meanwhile (late success / tab
+  // close), don't recreate it.
+  if (result.ok) {
+    showBannerState(tabId, ctx.platform, 'success', successMessage(ctx));
+  } else if (await getContext(tabId)) {
     await setContext(tabId, { ...ctx, autoCaptureInFlight: false, autoCaptureAttempted: true });
+    showBannerState(
+      tabId,
+      ctx.platform,
+      'notice',
+      `Auto-capture did not complete: ${result.error || 'unknown error'}. Log in fully, then click Capture Session.`,
+    );
   }
 });
 
@@ -393,15 +441,71 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
-  // Popup-initiated capture of a specific tab (from popup.js).
+  // Popup-initiated capture of a specific tab (from popup.js). popup.html has
+  // its own success/error status line, but the operator isn't necessarily
+  // watching the (tiny, easily-dismissed) popup — mirror the result into an
+  // in-page banner on the captured tab too, same as every other capture path.
+  // sendResponse fires first so this best-effort banner push never delays or
+  // breaks the response popup.js is waiting on.
+  //
+  // If no token is supplied, fall back to the active tab's stored capture context
+  // (getContext(tabId) → captureFromTab). If neither context nor token exists,
+  // respond with a clear error and show the in-page hint. Backward compatible:
+  // still accepts an explicit token in the message payload (for other backends,
+  // ReportBot dialect, or manual token-paste fallback if needed later).
   if (type === 'CAPTURE_ACTIVE_TAB') {
-    captureFromTab(msg.tabId, {
-      platform: msg.platform,
-      token: msg.token,
-      uploadUrl: msg.backendUrl,
-    })
-      .then(sendResponse)
-      .catch((e) => sendResponse({ ok: false, error: String(e?.message || e) }));
+    (async () => {
+      // If explicit token provided, use it; otherwise fall back to stored context
+      let ctx = null;
+      if (msg.token) {
+        // Backward compatibility: explicit token supplied (ReportBot dialect, etc.)
+        ctx = {
+          platform: msg.platform,
+          token: msg.token,
+          uploadUrl: msg.backendUrl,
+        };
+      } else {
+        // No token: try the stored capture context from the active tab
+        ctx = await getContext(msg.tabId);
+        if (!ctx) {
+          // Neither context nor token — show user the Authenticate flow hint
+          const error = 'Open EPMP → Settings → Brand Connections and click Authenticate — capture starts automatically.';
+          sendResponse({ ok: false, error });
+          showBannerState(
+            msg.tabId,
+            msg.platform,
+            'notice',
+            error,
+          );
+          return;
+        }
+      }
+
+      const ctxLike = { platform: ctx.platform, brandName: ctx.brandName };
+      try {
+        const res = await captureFromTab(msg.tabId, ctx);
+        sendResponse(res);
+        if (res.ok) {
+          showBannerState(msg.tabId, msg.platform, 'success', successMessage(ctxLike));
+        } else {
+          showBannerState(
+            msg.tabId,
+            msg.platform,
+            'notice',
+            `Capture did not complete: ${res.error || 'unknown error'}. Log in fully, then try again.`,
+          );
+        }
+      } catch (e) {
+        const error = String(e?.message || e);
+        sendResponse({ ok: false, error });
+        showBannerState(
+          msg.tabId,
+          msg.platform,
+          'notice',
+          `Capture did not complete: ${error}. Log in fully, then try again.`,
+        );
+      }
+    })();
     return true;
   }
 

@@ -1,11 +1,13 @@
 /**
- * EPMP Connect — popup (manual capture of the ACTIVE tab).
+ * EPMP Connect — popup (manual retry fallback).
  *
- * The universal fallback for every backend: pick nothing, paste the one-time
- * token, (optionally) set the backend URL once, and capture the session on the
- * Seller Center tab you're currently viewing. The heavy lifting (cookies +
- * localStorage + upload) is done by background.js so the logic stays in one
- * place. Backend URL ships with NO default — enter it once; it's saved locally.
+ * Normally, capture is driven by the in-app Authenticate button on EPMP, which
+ * opens the login tab and stores a capture context. If auto-capture doesn't fire
+ * or the operator needs to retry, this popup offers a manual "Capture Session"
+ * button that sends CAPTURE_ACTIVE_TAB to background.js, which falls back to the
+ * stored capture context (getContext(tabId)) when no token is supplied. Backend
+ * URL ships with NO default — enter it once; it's saved locally. The heavy lifting
+ * (cookies + localStorage + upload) is done by background.js.
  */
 
 // ── Platform detection (active tab URL) ──────────────────────────────────────
@@ -72,29 +74,27 @@ document.addEventListener('DOMContentLoaded', async () => {
 });
 
 async function onCapture() {
-  const token = $('tokenInput').value.trim();
   const backendUrl = $('apiUrlInput').value.trim();
 
-  if (!token) { setStatus('error', 'Paste the one-time token from the Sessions page.'); return; }
-  if (!backendUrl) {
-    $('settingsPanel').classList.add('open');
-    setStatus('error', 'Set the Backend API URL in Settings first.');
-    return;
-  }
+  // No hard backend-URL gate: the normal no-token path uses the stored capture
+  // context (uploadUrl) that the in-app Authenticate flow saved, so a manual
+  // retry works with the Settings field left blank. background.js falls back to
+  // that stored context and, only if neither a context nor a token exists,
+  // returns the "click Authenticate…" guidance. The URL is still forwarded when
+  // present for the explicit-token dialect (other backends / manual paste).
   if (!activePlatform) { setStatus('error', 'Open a Seller Center tab, then capture.'); return; }
 
-  await chrome.storage.local.set({ apiUrl: backendUrl });
+  if (backendUrl) await chrome.storage.local.set({ apiUrl: backendUrl });
   $('captureBtn').disabled = true;
   setStatus('loading', 'Capturing session…', true);
 
   chrome.runtime.sendMessage(
-    { type: 'CAPTURE_ACTIVE_TAB', tabId: activeTab.id, platform: activePlatform, token, backendUrl },
+    { type: 'CAPTURE_ACTIVE_TAB', tabId: activeTab.id, platform: activePlatform, backendUrl: backendUrl || undefined },
     (res) => {
       $('captureBtn').disabled = false;
       if (chrome.runtime.lastError) { setStatus('error', chrome.runtime.lastError.message); return; }
       if (res?.ok) {
         setStatus('success', `Captured ${res.cookieCount} cookies. Session uploaded.`);
-        $('tokenInput').value = '';
       } else {
         setStatus('error', res?.error || 'Capture failed.');
       }

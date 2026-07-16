@@ -23,25 +23,54 @@
   // Endpoints we PREFER (the real catalog, not a widget/suggestion feed).
   const PREFER = /(search_product_list|get_product_list|product\/local\/products\/list|mpsku\/list)/i;
 
-  function looksLikeProducts(json) {
-    if (!json || typeof json !== 'object') return false;
+  // Pull the product array out of a product-list response (known shapes).
+  function productArray(json) {
+    if (!json || typeof json !== 'object') return null;
     const roots = [json, json.data, json.data?.result, json.data?.module];
     const keys = ['list', 'products', 'items', 'product_list', 'page_list', 'productList', 'dataList'];
     for (const root of roots) {
       if (!root || typeof root !== 'object') continue;
       for (const k of keys) {
         const v = root[k];
-        if (Array.isArray(v) && v.length && typeof v[0] === 'object') return true;
+        if (Array.isArray(v) && v.length && typeof v[0] === 'object') return v;
       }
     }
-    return false;
+    return null;
+  }
+
+  function looksLikeProducts(json) {
+    return productArray(json) !== null;
+  }
+
+  // Does the product array carry actual product data (a name), or is it an
+  // ID-only list? Seller Center fires several product-shaped XHRs — some return
+  // hydrated rows (name/price/image, e.g. Shopee's `search_product_list`) and
+  // some return only item IDs (an id-only prefetch). A replay of an id-only
+  // endpoint yields nameless rows the backend can't persist, so we must NOT let
+  // one win discovery over a hydrated sibling. Checking a few entries for a
+  // name-ish field distinguishes them without hard-coding any endpoint.
+  function looksHydrated(json) {
+    const arr = productArray(json);
+    if (!arr) return false;
+    const hasName = (o) =>
+      o && typeof o === 'object' &&
+      [o.name, o.product_name, o.productName, o.title, o.product && o.product.name].some(
+        (v) => typeof v === 'string' && v.trim(),
+      );
+    return arr.slice(0, 5).some(hasName);
   }
 
   function record(url, method, body, json) {
     if (!RE.test(url)) return;
     if (!looksLikeProducts(json)) return;
-    const entry = { url, method, body: body || null, json, preferred: PREFER.test(url) };
-    if (entry.preferred) window.__epmpProductCapture.unshift(entry);
+    const hydrated = looksHydrated(json);
+    // "preferred" (the entry discovery locks onto first) requires BOTH a
+    // catalog-shaped URL AND hydrated rows — an id-only response never wins.
+    const entry = { url, method, body: body || null, json, hydrated, preferred: hydrated && PREFER.test(url) };
+    // Hydrated responses bubble to the front so `captured[0]` / find(preferred)
+    // pick real product data; id-only responses sink to the back as a last
+    // resort (the backend then falls back to the in-page worker).
+    if (hydrated) window.__epmpProductCapture.unshift(entry);
     else window.__epmpProductCapture.push(entry);
     if (window.__epmpProductCapture.length > MAX) window.__epmpProductCapture.length = MAX;
   }
