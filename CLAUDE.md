@@ -115,5 +115,22 @@ so it survives service-worker restarts; it's cleared on capture success or tab c
   do NOT remove the manual fallback or the one-shot guard.
 - **Host permissions are scoped** to the three platforms — never widen to
   `<all_urls>`.
+- **Seller-login auto-fill (v2.3.0+)** — `login-fill.js` is injected on-demand
+  (same `files:` + `func:` two-step pattern as `injectBanner`/`showBannerState`)
+  once a tracked tab's `onUpdated 'complete'` lands on the platform's own login
+  page (`LOGIN_PAGE_PATTERNS`/`looksLikeLoginPage` in `background.js` — the
+  mirror-image of `DASHBOARD_PATTERNS`). It only runs when the bridge payload
+  carried an optional `login: { username, password }` (EPMP's platform-accounts
+  vault vend). Fill-only, by design: it never submits the form and never touches
+  OTP/2FA, and it never logs the values — only a plain fields-filled count
+  crosses back to `background.js`. `login` is wiped from the tab's stored context
+  (`chrome.storage.session`) as soon as a fill sets a field, or after at most
+  `LOGIN_FILL_MAX_ATTEMPTS` (2) attempts with nothing to show for it, so it never
+  lingers. `pickLoginFields(doc, platform)` in `login-fill.js` is the one pure,
+  Node-testable piece (`login-fill.test.js`, run via `node --test`) — it's
+  duplicated as-is inside `window.__epmpConnectFillLogin` rather than imported,
+  because `chrome.scripting.executeScript` re-injection can't close over a
+  module-level function across the isolated-world boundary (same constraint
+  `banner.js`'s own header comment documents for `const`/`let` at top level).
 - Bump `version` in `manifest.json` and the Versioning note in `README.md` together
   on release.

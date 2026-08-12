@@ -56,6 +56,18 @@ records the product-list API response the page fetches, and the worker attaches
 if discovery fails, the session capture still succeeds. Backends that don't use it
 simply ignore the extra keys.
 
+### Seller-login auto-fill (optional)
+
+When a capture's `payload.login` carries `{ username, password }`, `login-fill.js`
+is injected once the login tab lands on the platform's own login page (host +
+path match) and fills the username + password inputs — using each platform's
+selectors for Lazada and Shopee, and a defensive single-visible-match fallback
+for TikTok. It only **fills**: it never submits the form, and the operator still
+completes login (and OTP/2FA) by hand. Values are never logged. `login` is wiped
+from the tab's stored capture context as soon as a fill sets a field, or after at
+most two attempts if nothing matched — so it never lingers. Omit `login` and the
+extension behaves exactly as before.
+
 ---
 
 ## Install (per operator machine)
@@ -97,7 +109,13 @@ window.postMessage({ __epmpPage: true, requestId, type: 'capture', payload }, lo
 //   { __epmpConnect: true, requestId, type: 'pong', version }
 //   { __epmpConnect: true, requestId, type: 'capture-ack', ok, error, tabId }
 ```
-`payload` = `{ platform, captureToken, uploadUrl, loginUrl, productListUrl?, brandId?, brandName?, forceFreshLogin? }`
+`payload` = `{ platform, captureToken, uploadUrl, loginUrl, productListUrl?, brandId?, brandName?, forceFreshLogin?, login? }`
+
+`login?` = `{ username, password }` — optional. When the calling backend vends a
+stored seller-login for this (brand, platform), the extension auto-fills the
+login form's username + password fields once the tab lands on the platform's
+login page (see [Seller-login auto-fill](#seller-login-auto-fill-optional)
+below). Omit it and nothing changes from prior versions.
 
 ### ReportBot dialect
 
@@ -124,6 +142,7 @@ token minted by the backend's Sessions page.
 | `bridge.js` | Page ↔ background relay (content script) — speaks both EPMP and ReportBot dialects |
 | `interceptor.js` | MAIN-world content script — passively records the product-list API response |
 | `banner.js` | Injected login-tab banner with the **Capture Session** button |
+| `login-fill.js` | Injected on-demand into the login tab — auto-fills username/password when `payload.login` is supplied; never auto-submits, never logs the values |
 | `popup.html` / `popup.js` | Toolbar popup — manual active-tab capture fallback |
 
 ## Permissions — why each is needed
@@ -149,6 +168,18 @@ Broad registrable domains (matched with all subdomains):
 - **TikTok:** `tiktok.com`, `tiktokshop.com`
 
 ## Versioning
+
+`2.3.0` — seller-login auto-fill: when a bridge-flow capture's `payload.login`
+carries `{ username, password }` (vended by EPMP's platform-accounts vault), the
+extension fills the username + password fields once the login tab lands on the
+platform's own login page — `input#account` + `input[type=password]` for Lazada,
+`input.shopee-input__input[type=text/password]` for Shopee, and a defensive
+single-visible-match fallback (skip rather than guess on 0 or >1 matches) for
+TikTok. Fill-only: it never submits the form and never touches OTP/2FA — the
+operator still completes login by hand. Values are never logged, and `login` is
+wiped from the tab's stored capture context as soon as a field is set (or after
+at most two attempts if nothing matched), so it never lingers. Omitting `login`
+from the payload leaves every existing capture flow unchanged.
 
 `2.2.0` — capture feedback and simplified popup UX: the banner now shows explicit
 success, notice, and error states (persistent green checkmark + brand name on

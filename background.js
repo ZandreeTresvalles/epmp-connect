@@ -75,6 +75,39 @@ function looksLikeDashboard(platform, urlStr) {
   }
 }
 
+// ── Login-page detection (seller-login auto-fill, v2.3.0) ───────────────────
+// The opposite check from DASHBOARD_PATTERNS above: that asserts an
+// authenticated page that ISN'T on AUTH_PATH; this asserts we're actually ON
+// the login form itself, so it's safe (and useful) to fill it. LOGIN_PATH is
+// deliberately a NARROWER subset of AUTH_PATH — login/signin/passport
+// fragments only, excluding verify/2fa/otp/captcha, which are post-username
+// steps where a username/password form doesn't exist.
+//
+// SHOPEE is a special case: sellers added to a brand log in through a
+// dedicated sub-account portal host (`subaccount.shopee.com`, per EPMP's
+// LOGIN_URLS), distinct from the `seller.shopee.ph` dashboard host, whose
+// landing path IS the login form — there's no separate /login suffix to
+// match. That root-path assumption is the one part of this file that
+// couldn't be confirmed against the live page while building this feature;
+// see the extension repo's task report for the flagged concern.
+const LOGIN_PATH = /(\/(login|signin|sign-in|passport|account\/login))/i;
+
+const LOGIN_PAGE_PATTERNS = {
+  LAZADA: (u) => /(^|\.)sellercenter\.lazada\.com\.ph$/.test(u.hostname) && LOGIN_PATH.test(u.pathname),
+  SHOPEE: (u) => /(^|\.)subaccount\.shopee\.com$/.test(u.hostname)
+    && (u.pathname === '/' || LOGIN_PATH.test(u.pathname)),
+  TIKTOK: (u) => /(^|\.)seller(-ph)?\.tiktok\.com$/.test(u.hostname) && LOGIN_PATH.test(u.pathname),
+};
+
+function looksLikeLoginPage(platform, urlStr) {
+  try {
+    const check = LOGIN_PAGE_PATTERNS[platform];
+    return !!check && check(new URL(urlStr));
+  } catch {
+    return false;
+  }
+}
+
 // ── Upload URL normalization ─────────────────────────────────────────────────
 // Callers give us one of: a bare origin (https://host), a base ending in /api,
 // or a full upload URL. Normalize all to {origin}/api/v1/automation/sessions.
@@ -182,6 +215,76 @@ async function injectBanner(tabId, platform) {
       args: [platform || ''],
     });
   } catch { /* tab may not be ready; onUpdated will retry */ }
+}
+
+// ── Seller-login auto-fill (v2.3.0) ──────────────────────────────────────────
+// First-party autofill into the operator's OWN login form — not stealth, not
+// anti-bot evasion. Fills only; the operator still clicks Login and completes
+// OTP/2FA by hand. See login-fill.js (injected below) for the field-picking
+// and value-setting logic and its security contract (never auto-submit,
+// never log the values).
+//
+// At most LOGIN_FILL_MAX_ATTEMPTS onUpdated 'complete' events get a fill
+// attempt per tab — normally just the first arrival, but SPA logins can
+// redirect through more than one URL that matches the login-page pattern
+// before the real form mounts, or (rarely) re-render and clear what was just
+// typed; a second attempt covers that without ever spinning indefinitely.
+// `login` is wiped from the tab context as soon as a fill actually sets a
+// field, or once the attempt cap is reached with nothing to show for it —
+// either way it never lingers in chrome.storage.session longer than needed.
+const LOGIN_FILL_MAX_ATTEMPTS = 2;
+
+// Inject login-fill.js (if not already present on this tab) and invoke it.
+// Returns the number of fields filled (0/1/2); never throws.
+async function fillLoginFields(tabId, platform, username, password) {
+  try {
+    await chrome.scripting.executeScript({ target: { tabId }, files: ['login-fill.js'] });
+    const [res] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: (p, u, pw) => (window.__epmpConnectFillLogin ? window.__epmpConnectFillLogin(p, u, pw) : 0),
+      args: [platform, username, password],
+    });
+    return res?.result || 0;
+  } catch {
+    return 0; // tab navigated away mid-injection, CSP blocked it, etc. — best-effort.
+  }
+}
+
+// Called from the onUpdated listener below whenever a tracked tab carries a
+// still-live `login` and finishes loading. No-ops immediately (and cheaply)
+// unless the tab is actually on the platform's login page.
+async function attemptLoginFill(tabId, ctx, tab) {
+  if (!ctx.login || !ctx.login.username || !ctx.login.password) return;
+
+  const attempts = ctx.loginFillAttempts || 0;
+  if (attempts >= LOGIN_FILL_MAX_ATTEMPTS) {
+    // Cap already reached on a previous 'complete' event — should have been
+    // wiped then, but wipe defensively here too rather than leave it stale.
+    const latest = await getContext(tabId);
+    if (latest && latest.login) {
+      const { login, ...rest } = latest;
+      await setContext(tabId, rest);
+    }
+    return;
+  }
+
+  if (!looksLikeLoginPage(ctx.platform, tab.url || '')) return;
+
+  const nextAttempts = attempts + 1;
+  const filledCount = await fillLoginFields(tabId, ctx.platform, ctx.login.username, ctx.login.password);
+
+  const latest = await getContext(tabId);
+  if (!latest) return; // capture already completed / tab closed meanwhile
+
+  if (filledCount > 0 || nextAttempts >= LOGIN_FILL_MAX_ATTEMPTS) {
+    // Either we actually set something (done — wipe now so the credentials
+    // don't linger), or we've used every attempt with nothing to show for it
+    // (also wipe — no more tries, never spin).
+    const { login, ...rest } = latest;
+    await setContext(tabId, { ...rest, loginFillAttempts: nextAttempts });
+  } else {
+    await setContext(tabId, { ...latest, loginFillAttempts: nextAttempts });
+  }
 }
 
 // ── Banner state helpers (success / notice / error feedback) ────────────────
@@ -312,7 +415,7 @@ async function startCapture(payload) {
   const platform = String(payload.platform || '').toUpperCase();
   const token = payload.token || payload.captureToken;
   const uploadUrl = payload.uploadUrl || payload.backendUrl;
-  const { loginUrl, productListUrl, forceFreshLogin, brandId, brandName } = payload;
+  const { loginUrl, productListUrl, forceFreshLogin, brandId, brandName, login } = payload;
 
   if (!platform || !PLATFORM_COOKIE_DOMAINS[platform]) {
     return { ok: false, error: `Invalid platform: ${payload.platform}` };
@@ -323,8 +426,18 @@ async function startCapture(payload) {
 
   if (forceFreshLogin) await clearPlatformCookies(platform);
 
+  // Optional platform-accounts vend (EPMP): { username, password } for
+  // seller-login auto-fill on the login tab. Validated defensively — never
+  // trust the shape of an external payload — and never logged. Anything
+  // malformed is dropped silently rather than surfacing a secret in an error.
+  const safeLogin = (login && typeof login.username === 'string' && typeof login.password === 'string')
+    ? { username: login.username, password: login.password }
+    : null;
+
   const tab = await chrome.tabs.create({ url: loginUrl });
-  await setContext(tab.id, { platform, token, uploadUrl, loginUrl, productListUrl, brandId, brandName });
+  await setContext(tab.id, {
+    platform, token, uploadUrl, loginUrl, productListUrl, brandId, brandName, login: safeLogin,
+  });
   // Banner is (re)injected by the onUpdated listener once the tab finishes loading.
   return { ok: true, started: true, tabId: tab.id };
 }
@@ -362,10 +475,25 @@ const NO_COOKIES_RE = /no cookies found/i;
 
 chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
   if (info.status !== 'complete') return;
-  const ctx = await getContext(tabId);
+  let ctx = await getContext(tabId);
   if (!ctx) return;
 
   injectBanner(tabId, ctx.platform);
+
+  // Seller-login auto-fill: independent of the auto-capture flow below (it
+  // targets the LOGIN page, auto-capture targets the DASHBOARD page — the
+  // two URL patterns are mutually exclusive by construction). No-ops unless
+  // ctx.login is still present, so this is cheap on every other 'complete'.
+  // Re-read the context afterward: attemptLoginFill may have wiped `login`
+  // (or bumped loginFillAttempts) in storage, and every `{ ...ctx, ... }`
+  // spread below must build on that fresh copy — otherwise this stale `ctx`
+  // (captured before the wipe) would resurrect the just-cleared credentials
+  // the next time this handler writes the context back out.
+  if (ctx.login) {
+    await attemptLoginFill(tabId, ctx, tab).catch(() => {});
+    ctx = await getContext(tabId);
+    if (!ctx) return; // capture completed / tab closed while we awaited
+  }
 
   // Bail if already attempted (one-shot), already running (re-entrancy from a
   // discovery navigation), or this isn't an authenticated dashboard URL.
