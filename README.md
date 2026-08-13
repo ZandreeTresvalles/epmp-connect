@@ -175,6 +175,22 @@ Broad registrable domains (matched with all subdomains):
 
 ## Versioning
 
+`2.6.2` — refuse to capture an unauthenticated session. The only pre-upload
+check was `storageState.cookies.length > 0`, but Shopee/Lazada set cookies on
+their login/verification pages too — so a capture whose login never completed
+(e.g. a failed OTP verification that silently logged the operator back out)
+uploaded a logged-OUT session, which bounced straight to
+`accounts.shopee.ph/seller/login` on its first heartbeat and read as "expired
+within the same minute" (ArlaPH SHOPEE, 2026-08-13). `captureFromTab` now
+checks the tab's live URL against `AUTH_PATH` (login/signin/passport/verify/
+otp/captcha) right before upload — after `runDiscovery` has navigated to the
+product list, a dead session redirects that navigation to a login URL, making
+the current URL the authoritative "are we actually logged in" signal. On a
+login/verification URL it shows an error banner ("Not logged in yet — finish
+logging in, then capture again") and returns without uploading or running
+post-capture hygiene, so nothing is persisted and no cookies are wiped — the
+operator finishes login and retries.
+
 `2.6.1` — two fixes:
 
 - **Pre-capture wipe scoped back to cookies-only.** `2.6.0`'s pre-login hard

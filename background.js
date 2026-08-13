@@ -607,6 +607,33 @@ async function captureFromTab(tabId, ctxOverride) {
     if (disc.sampleResponse) body.sampleResponse = disc.sampleResponse;
   }
 
+  // RC2 guard (2026-08-13): refuse to upload an UNAUTHENTICATED session.
+  // Shopee/Lazada set cookies even on their login/verification pages, so the
+  // `storageState.cookies.length` check above passes for a logged-OUT session
+  // — which is exactly how a capture whose login never completed (e.g. an OTP
+  // verification that failed) got uploaded, then bounced straight to
+  // `accounts.shopee.ph/seller/login` on its first heartbeat and read as
+  // "expired within the same minute" (ArlaPH SHOPEE, 2026-08-13). If a
+  // productListUrl was set, runDiscovery just navigated the tab there; a dead
+  // session redirects that navigation to a login/verification URL, so the
+  // tab's CURRENT url is the authoritative "are we actually logged in" signal.
+  // AUTH_PATH is the union of login/signin/passport/verify/otp/captcha
+  // fragments already defined for auto-capture detection. Fail BEFORE the
+  // upload and BEFORE post-capture hygiene, so nothing is persisted and no
+  // cookies are wiped — the operator finishes logging in and retries.
+  const liveTab = await chrome.tabs.get(tabId).catch(() => null);
+  const liveUrl = (liveTab && liveTab.url) || '';
+  if (AUTH_PATH.test(liveUrl)) {
+    showBannerState(
+      tabId, ctx.platform, 'error',
+      `Not logged in yet — the ${PLATFORM_LABELS[ctx.platform] || ctx.platform} page is still on a login/verification screen. Finish logging in (including any OTP), then capture again.`,
+    );
+    return {
+      ok: false,
+      error: `Session not authenticated — the page is on a login/verification URL (${liveUrl.slice(0, 80)}). Complete login, then re-capture.`,
+    };
+  }
+
   showBannerState(tabId, ctx.platform, 'working', `Uploading your ${captureLabel(ctx)} session to EPMP…`);
   await uploadSession(uploadUrl, ctx.token, body);
   await clearContext(tabId);
