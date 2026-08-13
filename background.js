@@ -77,16 +77,23 @@ const TEST_TIMEOUTS = {
 // canonical module. Answering them in several places, each slightly
 // different, is exactly what produced five point-fix releases in two days
 // (see page-state.js's header). Never re-define them here.
-const {
-  isAuthPath,
-  isLoginPage,
-  isDashboardUrl,
-  AUTHENTICATED_CONTENT_SELECTOR,
-} = self.EpmpPageState;
+// NEVER destructure these into bare top-level `const`s here. importScripts()
+// shares ONE global lexical scope with this file, so a top-level
+// `const isAuthPath = …` in background.js collides with page-state.js's own
+// top-level declaration of the same name and the service worker dies at
+// registration with "Identifier 'X' has already been declared" — which
+// presents to the operator as "Extension did not respond — is EPMP Connect
+// installed?" (shipped briefly in v2.7.0; see page-state-collision.test.js,
+// which fails if this rule is broken again). Node's require() gives each
+// module its own scope, so node --test can NOT catch this — only the
+// collision test can.
+const PageState = self.EpmpPageState;
 
-// Aliases so the existing call sites below keep reading naturally.
-const looksLikeDashboard = isDashboardUrl;
-const looksLikeLoginPage = isLoginPage;
+// Locally-named aliases (names that deliberately do NOT exist in
+// page-state.js, so they cannot collide).
+const looksLikeDashboard = PageState.isDashboardUrl;
+const looksLikeLoginPage = PageState.isLoginPage;
+const looksLikeAuthPath = PageState.isAuthPath;
 
 // ── Upload URL normalization ─────────────────────────────────────────────────
 // Callers give us one of: a bare origin (https://host), a base ending in /api,
@@ -701,7 +708,7 @@ async function captureFromTab(tabId, ctxOverride) {
   const authedByDiscovery = body.endpointStatus === 'discovered';
   const authedByContent = authedByDiscovery ? false : await hasAuthenticatedContent(tabId);
   if (!authedByDiscovery && !authedByContent) {
-    const onLoginUrl = isAuthPath(liveUrl);
+    const onLoginUrl = looksLikeAuthPath(liveUrl);
     showBannerState(
       tabId, ctx.platform, 'error',
       onLoginUrl

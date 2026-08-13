@@ -175,6 +175,21 @@ Broad registrable domains (matched with all subdomains):
 
 ## Versioning
 
+`2.7.1` — **hotfix: 2.7.0 could not start.** `importScripts('page-state.js')`
+shares ONE global lexical scope with `background.js`, so background.js's
+`const { isAuthPath, AUTHENTICATED_CONTENT_SELECTOR, … } = self.EpmpPageState`
+collided with page-state.js's own top-level declarations. Chrome refused to
+register the service worker (`Identifier 'AUTHENTICATED_CONTENT_SELECTOR' has
+already been declared` / `Service worker registration failed. Status code: 15`)
+and the extension was completely dead — the web app reported "Extension did
+not respond — is EPMP Connect installed?". background.js now reads the module
+off `self.EpmpPageState` under local alias names that deliberately do not
+exist in page-state.js. New `page-state-collision.test.js` rebuilds the real
+service-worker realm with `vm` (one context + a genuine `importScripts`) and
+fails on any duplicate top-level declaration — node's `require()` gives every
+file its own scope, which is exactly why all 46 other tests passed against a
+build that could not even boot.
+
 `2.7.0` — **capture now requires POSITIVE proof of authentication, and page
 state is answered in exactly one place.** Five releases in two days
 (2.5.0→2.6.4) each patched a symptom of one root problem: "is this an
