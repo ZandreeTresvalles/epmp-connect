@@ -175,6 +175,28 @@ Broad registrable domains (matched with all subdomains):
 
 ## Versioning
 
+`2.7.2` — three fixes, all found by investigating "the capture looks stuck"
+and "TikTok filled the wrong field":
+- **Stuck captures.** `chrome.scripting.executeScript({files})` evaluates an
+  injected file into the target world's GLOBAL scope, and the capture gate
+  re-injects `page-state.js` on every 500ms poll tick — so the 2nd injection
+  threw "Identifier 'AUTH_PATH' has already been declared", the caller
+  swallowed it, and the authenticated-content check could never succeed after
+  its first tick. The capture was then refused with no visible cause.
+  `page-state.js` and `login-fill.js` are now wrapped in IIFEs, making
+  re-injection idempotent (this also cost `login-fill` its second attempt —
+  the retry that exists precisely for late-mounting forms).
+- **TikTok typed the email into the PHONE box.** Probed live: the seller
+  login renders both forms and defaults to PHONE (`input[type=tel][name=mobile]`
+  visible, `input[type=email][name=email]` hidden). The old selector list
+  matched the phone box by placeholder. Phone tokens are removed from the
+  username selector, and the fill now clicks TikTok's own **"Log in with
+  email"** tab first (UI toggle only — never a submit).
+- **A login URL is disqualifying again.** 2.7.0 made positive proof the ONLY
+  test, but TikTok's login page renders a visible element matching the
+  authenticated-content selector, so a logged-OUT page could have passed.
+  Both tests now apply: never on a login/verification URL, AND positive proof.
+
 `2.7.1` — **hotfix: 2.7.0 could not start.** `importScripts('page-state.js')`
 shares ONE global lexical scope with `background.js`, so background.js's
 `const { isAuthPath, AUTHENTICATED_CONTENT_SELECTOR, … } = self.EpmpPageState`

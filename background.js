@@ -705,10 +705,20 @@ async function captureFromTab(tabId, ctxOverride) {
   // retries on the same tab.
   const liveTab = await chrome.tabs.get(tabId).catch(() => null);
   const liveUrl = (liveTab && liveTab.url) || '';
-  const authedByDiscovery = body.endpointStatus === 'discovered';
-  const authedByContent = authedByDiscovery ? false : await hasAuthenticatedContent(tabId);
-  if (!authedByDiscovery && !authedByContent) {
-    const onLoginUrl = looksLikeAuthPath(liveUrl);
+  // A login/verification URL is DISQUALIFYING on its own, checked FIRST and
+  // independently of any positive signal. v2.7.0 made positive proof the only
+  // test, which was a regression: TikTok's own login page renders a visible
+  // element matching AUTHENTICATED_CONTENT_SELECTOR (probed 2026-08-14 — 1
+  // visible marker on seller-ph.tiktok.com/account/login), so a logged-OUT
+  // TikTok page could have satisfied the content check and uploaded a dead
+  // session — exactly what v2.6.2's URL check existed to stop. Both tests now
+  // apply: never on an auth path, AND positive proof.
+  const onLoginUrl = looksLikeAuthPath(liveUrl);
+  const authedByDiscovery = !onLoginUrl && body.endpointStatus === 'discovered';
+  const authedByContent = !onLoginUrl && !authedByDiscovery
+    ? await hasAuthenticatedContent(tabId)
+    : false;
+  if (onLoginUrl || (!authedByDiscovery && !authedByContent)) {
     showBannerState(
       tabId, ctx.platform, 'error',
       onLoginUrl

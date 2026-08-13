@@ -43,6 +43,16 @@
  *   - `require('./page-state.js')` in node --test.
  */
 
+// ── Re-injection safety (v2.7.2) ────────────────────────────────────────────
+// EVERYTHING below is wrapped in an IIFE. chrome.scripting.executeScript({files})
+// evaluates this file into the target world's GLOBAL scope, and the capture
+// gate injects it on every poll tick — a top-level `const` would therefore
+// throw "Identifier 'AUTH_PATH' has already been declared" on the 2nd
+// injection, which the caller swallows, so the authenticated-content check
+// could never succeed after its first tick and captures hung ("this capture
+// looks stuck"). The same shape killed the service worker in 2.7.0. Inside a
+// function scope, re-running the file is simply idempotent.
+(function () {
 // ── SPEC-3: AUTH_PATH ───────────────────────────────────────────────────────
 // Mirrors what each backend's own scraper treats as "still logging in":
 //   - encoder-reports tiktok.ts: /account/login | /passport/ | /sign-in | login
@@ -201,3 +211,4 @@ if (typeof module !== 'undefined' && module.exports) {
     isAuthenticatedContent,
   };
 }
+}());

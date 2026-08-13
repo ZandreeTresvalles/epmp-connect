@@ -43,6 +43,12 @@
 // login-fill.test.js can assert against the exact selector strings rather
 // than duplicating them.
 //
+// ── Re-injection safety (v2.7.2) ────────────────────────────────────────────
+// Wrapped in an IIFE for the same reason as page-state.js: background.js
+// injects this file once per fill attempt, and a top-level `const` makes the
+// SECOND injection throw "already been declared" — silently costing the
+// retry that exists precisely for late-mounting forms.
+(function () {
 // NOTE (v2.6.4): the "TIKTOK never auto-filled" evidence below predates the
 // late-mount fix in fillWhenReady(). The fill used to run once, immediately
 // on the tab's 'complete' event — before ANY of these SPAs had rendered their
@@ -72,18 +78,23 @@ function buildLoginSelectors() {
       username: 'input.shopee-input__input[type="text"]',
       password: 'input.shopee-input__input[type="password"]',
     },
+    // TIKTOK (probed live 2026-08-14 on seller-ph.tiktok.com/account/login):
+    // the page renders BOTH forms and defaults to PHONE — the visible field is
+    // `input[type=tel][name=mobile]` ("Enter your phone number") while
+    // `input[type=email][name=email]` sits hidden until the "Log in with
+    // email" tab is clicked (see ensureTikTokEmailTab). This org logs in with
+    // EMAIL, so phone-matching tokens are deliberately REMOVED: they made the
+    // phone box the single visible match, and the email address was typed
+    // into it. `input[type="text"]` is dropped for the same reason — it
+    // matched the country-code search box.
     TIKTOK: {
       username: [
-        'input[type="text"]',
         'input[type="email"]',
         'input[name*="email" i]',
+        'input[placeholder*="email" i]',
         'input[name*="account" i]',
         'input[name*="loginName" i]',
         'input[name*="username" i]',
-        'input[name*="phone" i]',
-        'input[placeholder*="email" i]',
-        'input[placeholder*="phone" i]',
-        'input[placeholder*="username" i]',
         'input[autocomplete="username"]',
         'input[autocomplete="email"]',
       ].join(', '),
@@ -142,6 +153,50 @@ function setNativeInputValue(el, value) {
   el.dispatchEvent(new Event('change', { bubbles: true }));
 }
 
+// ── TikTok: switch to the EMAIL tab (v2.7.2) ────────────────────────────────
+// TikTok's seller login opens on the PHONE tab; the email field exists but is
+// hidden until "Log in with email" is clicked. Without this the fill either
+// found no visible email field or (worse) put the email address in the phone
+// box. Clicks ONLY that tab — a navigation/UI toggle on the operator's own
+// login page, never a submit, and never anything credential-related.
+// Idempotent and cheap: no-ops as soon as an email input is visible.
+function isElementVisible(el) {
+  if (!el) return false;
+  if ('offsetParent' in el && el.offsetParent === null) return false;
+  if (typeof el.getBoundingClientRect === 'function') {
+    const r = el.getBoundingClientRect();
+    if (!r || r.width <= 0 || r.height <= 0) return false;
+  }
+  return true;
+}
+
+function ensureTikTokEmailTab(doc) {
+  let emailInputs = [];
+  try {
+    emailInputs = Array.from(doc.querySelectorAll('input[type="email"], input[name*="email" i]'));
+  } catch {
+    return false;
+  }
+  if (emailInputs.some(isElementVisible)) return false; // already on the email form
+
+  let candidates = [];
+  try {
+    candidates = Array.from(doc.querySelectorAll('span, div, button, a'));
+  } catch {
+    return false;
+  }
+  const tab = candidates.find((e) => {
+    const text = (e.textContent || '').replace(/\s+/g, ' ').trim();
+    if (!/^log ?in with email$|email login/i.test(text)) return false;
+    return (!e.children || e.children.length === 0) && isElementVisible(e);
+  });
+  if (tab && typeof tab.click === 'function') {
+    tab.click();
+    return true;
+  }
+  return false;
+}
+
 // ── Wait for late-mounting fields (v2.6.4) ──────────────────────────────────
 // Every one of these login pages is a JS-rendered SPA, and background.js
 // injects this on the tab's `status === 'complete'` event — which fires when
@@ -179,6 +234,8 @@ async function fillWhenReady(doc, platform, username, password, opts) {
   let passwordDone = !password;
 
   for (;;) {
+    // TikTok opens on the phone tab — reveal the email form before picking.
+    if (platform === 'TIKTOK' && !usernameDone) ensureTikTokEmailTab(doc);
     const { usernameEl, passwordEl } = pickLoginFields(doc, platform);
     if (!usernameDone && usernameEl) {
       setNativeInputValue(usernameEl, username);
@@ -215,5 +272,6 @@ if (typeof window !== 'undefined') {
 // exists in the browser's isolated-world content-script context, so this is
 // dead code there — the guard just keeps it from throwing if it ever did.
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { pickLoginFields, setNativeInputValue, buildLoginSelectors, fillWhenReady };
+  module.exports = { pickLoginFields, setNativeInputValue, buildLoginSelectors, fillWhenReady, ensureTikTokEmailTab };
 }
+}());

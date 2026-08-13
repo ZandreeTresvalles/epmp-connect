@@ -330,3 +330,75 @@ test('fillWhenReady: never fills a password field it was not given a password fo
   assert.equal(filled, 1);
   assert.equal(pass.value, '', 'password input left untouched');
 });
+
+// ── TikTok email tab (v2.7.2) ───────────────────────────────────────────────
+// Probed live 2026-08-14: seller-ph.tiktok.com/account/login renders BOTH
+// forms and defaults to PHONE — the visible field is
+// input[type=tel][name=mobile], while input[type=email][name=email] is hidden
+// until "Log in with email" is clicked. The old selector list matched the
+// phone box by placeholder, so the operator's EMAIL was typed into it.
+function tkInput({ type, name, ph, visible }) {
+  return {
+    type, name, placeholder: ph, className: '',
+    offsetParent: visible ? {} : null,
+    getBoundingClientRect: () => ({ width: visible ? 300 : 0, height: visible ? 32 : 0 }),
+    value: '', dispatchEvent() { return true; },
+  };
+}
+
+// A doc that answers real attribute selectors against a fixed element set.
+function tkDoc(elements, onTabClick) {
+  const matches = (el, sel) => sel.split(',').map((s) => s.trim()).some((part) => {
+    let m = /^input\[type="([^"]+)"\]$/.exec(part);
+    if (m) return el.type === m[1];
+    m = /^input\[(name|placeholder)\*="([^"]+)" i\]$/.exec(part);
+    if (m) return String(el[m[1] === 'name' ? 'name' : 'placeholder'] || '').toLowerCase().includes(m[2].toLowerCase());
+    m = /^input\[autocomplete="([^"]+)"\]$/.exec(part);
+    if (m) return el.autocomplete === m[1];
+    return false;
+  });
+  return {
+    querySelectorAll(sel) {
+      if (/span, div, button, a/.test(sel)) {
+        return [{
+          textContent: 'Log in with email', children: [],
+          offsetParent: {}, getBoundingClientRect: () => ({ width: 120, height: 20 }),
+          click: onTabClick,
+        }];
+      }
+      return elements.filter((e) => matches(e, sel));
+    },
+  };
+}
+
+test('TikTok: the email address is NEVER typed into the phone field', () => {
+  const phone = tkInput({ type: 'tel', name: 'mobile', ph: 'Enter your phone number', visible: true });
+  const email = tkInput({ type: 'email', name: 'email', ph: 'Enter your email address', visible: false });
+  const pass = tkInput({ type: 'password', name: 'password', ph: 'Enter your password', visible: true });
+  const { usernameEl } = pickLoginFields(tkDoc([phone, email, pass]), 'TIKTOK');
+  assert.equal(usernameEl, null, 'with only the phone box visible, there is no username field to fill');
+});
+
+test('TikTok: picks the email input once the email tab is showing', () => {
+  const email = tkInput({ type: 'email', name: 'email', ph: 'Enter your email address', visible: true });
+  const pass = tkInput({ type: 'password', name: 'password', ph: 'Enter your password', visible: true });
+  const { usernameEl, passwordEl } = pickLoginFields(tkDoc([email, pass]), 'TIKTOK');
+  assert.equal(usernameEl, email);
+  assert.equal(passwordEl, pass);
+});
+
+test('ensureTikTokEmailTab: clicks "Log in with email" while the email field is hidden', () => {
+  const { ensureTikTokEmailTab } = require('./login-fill.js');
+  let clicked = 0;
+  const email = tkInput({ type: 'email', name: 'email', ph: 'Enter your email address', visible: false });
+  assert.equal(ensureTikTokEmailTab(tkDoc([email], () => { clicked += 1; })), true);
+  assert.equal(clicked, 1);
+});
+
+test('ensureTikTokEmailTab: no-ops once an email field is visible', () => {
+  const { ensureTikTokEmailTab } = require('./login-fill.js');
+  let clicked = 0;
+  const email = tkInput({ type: 'email', name: 'email', ph: 'Enter your email address', visible: true });
+  assert.equal(ensureTikTokEmailTab(tkDoc([email], () => { clicked += 1; })), false);
+  assert.equal(clicked, 0, 'must not keep clicking the tab');
+});
