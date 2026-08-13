@@ -175,6 +175,21 @@ Broad registrable domains (matched with all subdomains):
 
 ## Versioning
 
+`2.6.4` — **autofill now waits for the login form to render.** Every one of
+these login pages is a JS-rendered SPA, but the fill ran exactly once, on the
+tab's `complete` event — which fires when the *document* finishes loading,
+typically before the framework has rendered any inputs. It found nothing,
+returned 0, and never retried (an SPA fires no second `complete`, so the one
+remaining attempt never came either). That is why autofill appeared to work
+occasionally and silently did nothing the rest of the time — on every brand
+and every platform, regardless of stored credentials. Measured 2026-08-13:
+Shopee's Main/Sub OAuth form needed ~9 seconds before its inputs existed.
+`fillWhenReady()` now polls every 250ms for up to 15s, filling the username
+and password independently the moment each becomes available (so a form whose
+password field mounts later is also covered), and stops as soon as both are
+done or the deadline passes. Still fill-only — it never submits, and never
+logs the values.
+
 `2.6.3` — steer Shopee captures to the **Main / Sub Account** login. Shopee's
 seller login defaults to the main-account form (`input[name=loginKey]`), but
 brands connect through SUB-accounts (e.g. `arlaph.dataccess`). That page has a

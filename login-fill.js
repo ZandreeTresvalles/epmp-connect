@@ -43,6 +43,13 @@
 // login-fill.test.js can assert against the exact selector strings rather
 // than duplicating them.
 //
+// NOTE (v2.6.4): the "TIKTOK never auto-filled" evidence below predates the
+// late-mount fix in fillWhenReady(). The fill used to run once, immediately
+// on the tab's 'complete' event — before ANY of these SPAs had rendered their
+// form — so a miss proved nothing about the selectors. Re-verify against a
+// live TikTok page before broadening these further; the timing bug was the
+// more likely culprit, and it applied to all three platforms.
+//
 // LAZADA / SHOPEE selectors below are verified against the real seller login
 // forms. TIKTOK still has no confirmed stable selector — a real capture
 // (2026-08-13) showed the seller login form did NOT get auto-filled, and its
@@ -135,26 +142,72 @@ function setNativeInputValue(el, value) {
   el.dispatchEvent(new Event('change', { bubbles: true }));
 }
 
+// ── Wait for late-mounting fields (v2.6.4) ──────────────────────────────────
+// Every one of these login pages is a JS-rendered SPA, and background.js
+// injects this on the tab's `status === 'complete'` event — which fires when
+// the DOCUMENT finished loading, i.e. typically BEFORE the framework has
+// rendered the form. The original one-shot implementation ran a single
+// synchronous `pickLoginFields` at that instant, found nothing, and returned
+// 0 with no retry: since an SPA does not fire a second 'complete', the one
+// remaining attempt never came either. That is why autofill "worked
+// sometimes" (a slow/cached load that happened to have the form up) and
+// silently did nothing the rest of the time, on every brand and platform.
+// Measured 2026-08-13: the Shopee Main/Sub OAuth form needed ~9s before its
+// inputs existed in the DOM.
+//
+// So: poll instead of guessing once. Each field is filled independently the
+// moment IT becomes available (which also covers a form whose password field
+// mounts after the username step), and the loop exits as soon as both are
+// done or the deadline passes. Bounded, never throws, and entirely
+// brand-agnostic — it fixes autofill for every brand and any future platform
+// whose form mounts late, rather than per-page selector guessing.
+const FILL_POLL_INTERVAL_MS = 250;
+const FILL_TIMEOUT_MS = 15000;
+
+async function fillWhenReady(doc, platform, username, password, opts) {
+  const o = opts || {};
+  const intervalMs = o.intervalMs || FILL_POLL_INTERVAL_MS;
+  const timeoutMs = o.timeoutMs || FILL_TIMEOUT_MS;
+  const now = o.now || (() => Date.now());
+  const sleep = o.sleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
+
+  const deadline = now() + timeoutMs;
+  let filled = 0;
+  // A credential half we were not given is "already done" — never block the
+  // loop (or the deadline) waiting for a field we would not fill anyway.
+  let usernameDone = !username;
+  let passwordDone = !password;
+
+  for (;;) {
+    const { usernameEl, passwordEl } = pickLoginFields(doc, platform);
+    if (!usernameDone && usernameEl) {
+      setNativeInputValue(usernameEl, username);
+      usernameDone = true;
+      filled += 1;
+    }
+    if (!passwordDone && passwordEl) {
+      setNativeInputValue(passwordEl, password);
+      passwordDone = true;
+      filled += 1;
+    }
+    if (usernameDone && passwordDone) return filled;
+    if (now() >= deadline) return filled;
+    await sleep(intervalMs);
+  }
+}
+
 // Only defined in a real page context (has `window`) — guarded so this file
 // can also be `require()`d from a plain Node test without throwing.
 if (typeof window !== 'undefined') {
   /**
    * Fill the login form. Never submits, never logs username/password.
-   * Returns a plain count (0/1/2) of fields actually set — the only thing
-   * that crosses back to background.js.
+   * Resolves to a plain count (0/1/2) of fields actually set — the only
+   * thing that crosses back to background.js. Returning a Promise is safe:
+   * `chrome.scripting.executeScript` awaits a promise result before
+   * resolving `res.result`.
    */
   window.__epmpConnectFillLogin = function (platform, username, password) {
-    const { usernameEl, passwordEl } = pickLoginFields(document, platform);
-    let filled = 0;
-    if (usernameEl && username) {
-      setNativeInputValue(usernameEl, username);
-      filled += 1;
-    }
-    if (passwordEl && password) {
-      setNativeInputValue(passwordEl, password);
-      filled += 1;
-    }
-    return filled;
+    return fillWhenReady(document, platform, username, password);
   };
 }
 
@@ -162,5 +215,5 @@ if (typeof window !== 'undefined') {
 // exists in the browser's isolated-world content-script context, so this is
 // dead code there — the guard just keeps it from throwing if it ever did.
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { pickLoginFields, setNativeInputValue, buildLoginSelectors };
+  module.exports = { pickLoginFields, setNativeInputValue, buildLoginSelectors, fillWhenReady };
 }

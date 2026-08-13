@@ -234,3 +234,99 @@ test('unknown platform -> no selectors, both fields null', () => {
   assert.equal(usernameEl, null);
   assert.equal(passwordEl, null);
 });
+
+// ── fillWhenReady: wait for late-mounting SPA fields (v2.6.4) ───────────────
+// The regression these lock down: background.js injects the fill on the tab's
+// 'complete' event, which fires BEFORE an SPA renders its login form. The old
+// one-shot implementation queried once, found nothing, and returned 0 — and
+// since an SPA fires no second 'complete', autofill silently never happened.
+// Measured: Shopee's Main/Sub OAuth form needed ~9s before its inputs existed.
+function makeInput(cls, type) {
+  return {
+    className: cls,
+    type,
+    offsetParent: {},
+    value: '',
+    getBoundingClientRect: () => ({ width: 200, height: 30 }),
+    dispatchEvent() { return true; },
+  };
+}
+
+// A doc that renders NOTHING until the Nth querySelectorAll call, then serves
+// the real Shopee form — the exact late-mount shape.
+function lateMountDoc(readyAfterCalls, elements) {
+  let calls = 0;
+  return {
+    get callCount() { return calls; },
+    querySelectorAll(selector) {
+      calls += 1;
+      if (calls < readyAfterCalls) return [];
+      return elements[selector] || [];
+    },
+  };
+}
+
+// Deterministic clock/sleep so the polling loop is exercised without waiting.
+function fakeTimers() {
+  let t = 0;
+  return { now: () => t, sleep: async (ms) => { t += ms; } };
+}
+
+test('fillWhenReady: fills a form that mounts AFTER the first poll (the SPA regression)', async () => {
+  const { fillWhenReady } = require('./login-fill.js');
+  const user = makeInput('shopee-input__input', 'text');
+  const pass = makeInput('shopee-input__input', 'password');
+  // pickLoginFields queries username and password selectors separately, so a
+  // form that appears on the 3rd query is "late" for both.
+  const doc = lateMountDoc(3, {
+    'input.shopee-input__input[type="text"]': [user],
+    'input.shopee-input__input[type="password"]': [pass],
+  });
+  const { now, sleep } = fakeTimers();
+  const filled = await fillWhenReady(doc, 'SHOPEE', 'arlaph.dataccess', 'pw', { now, sleep, intervalMs: 250, timeoutMs: 15000 });
+  assert.equal(filled, 2, 'both fields filled once the form mounted');
+  assert.equal(user.value, 'arlaph.dataccess');
+  assert.equal(pass.value, 'pw');
+});
+
+test('fillWhenReady: fills each field independently as it appears', async () => {
+  const { fillWhenReady } = require('./login-fill.js');
+  const user = makeInput('shopee-input__input', 'text');
+  const pass = makeInput('shopee-input__input', 'password');
+  let calls = 0;
+  const doc = {
+    querySelectorAll(selector) {
+      calls += 1;
+      if (selector === 'input.shopee-input__input[type="text"]') return [user];
+      // password only shows up later (two-step-ish form)
+      return calls > 4 ? [pass] : [];
+    },
+  };
+  const { now, sleep } = fakeTimers();
+  const filled = await fillWhenReady(doc, 'SHOPEE', 'u', 'p', { now, sleep, intervalMs: 250, timeoutMs: 15000 });
+  assert.equal(filled, 2);
+  assert.equal(user.value, 'u');
+  assert.equal(pass.value, 'p');
+});
+
+test('fillWhenReady: gives up at the deadline instead of spinning forever', async () => {
+  const { fillWhenReady } = require('./login-fill.js');
+  const doc = { querySelectorAll: () => [] }; // form never mounts
+  const { now, sleep } = fakeTimers();
+  const filled = await fillWhenReady(doc, 'SHOPEE', 'u', 'p', { now, sleep, intervalMs: 250, timeoutMs: 1000 });
+  assert.equal(filled, 0, 'returns 0 rather than hanging');
+});
+
+test('fillWhenReady: never fills a password field it was not given a password for', async () => {
+  const { fillWhenReady } = require('./login-fill.js');
+  const user = makeInput('shopee-input__input', 'text');
+  const pass = makeInput('shopee-input__input', 'password');
+  const doc = fakeDoc({
+    'input.shopee-input__input[type="text"]': [user],
+    'input.shopee-input__input[type="password"]': [pass],
+  });
+  const { now, sleep } = fakeTimers();
+  const filled = await fillWhenReady(doc, 'SHOPEE', 'u', '', { now, sleep });
+  assert.equal(filled, 1);
+  assert.equal(pass.value, '', 'password input left untouched');
+});
