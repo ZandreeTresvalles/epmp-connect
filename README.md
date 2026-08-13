@@ -175,6 +175,16 @@ Broad registrable domains (matched with all subdomains):
 
 ## Versioning
 
+`2.7.3` — **the Shopee "Login with Main/Sub Account" click now waits for the
+button.** It previously marked itself done BEFORE knowing the click landed, so
+on a slow render (these pages are all JS-rendered) the click missed and was
+never retried — stranding the operator on the main-account form with no
+explanation. It now polls for the button, and only records the attempt as done
+when the click actually happened; an in-flight guard keeps a second page event
+from starting a parallel poll. This is the same act-once shape as the autofill
+bug (2.6.4) and the stuck-capture bug (2.7.2), found by auditing for the
+pattern rather than waiting for it to be reported.
+
 `2.7.2` — three fixes, all found by investigating "the capture looks stuck"
 and "TikTok filled the wrong field":
 - **Stuck captures.** `chrome.scripting.executeScript({files})` evaluates an

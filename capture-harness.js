@@ -179,7 +179,8 @@ function createHarness() {
       return [{ result: true }]; // banner push — result unused by callers
     }
     if (src.includes('el.click()')) {
-      const present = state.shopeeButtonPresent[tabId];
+      const raw = state.shopeeButtonPresent[tabId];
+      const present = typeof raw === 'function' ? raw() : raw;
       return [{ result: !!present }];
     }
     return [{ result: undefined }];
@@ -272,7 +273,11 @@ function createHarness() {
     setProductCapture(tabId, captured) { state.productCapture[tabId] = captured; },
     setLocalStorage(tabId, ls) { state.localStorageByTab[tabId] = ls; },
     setFillLoginResult(tabId, count) { state.fillLoginResult[tabId] = count; },
-    setShopeeButtonPresent(tabId, present) { state.shopeeButtonPresent[tabId] = !!present; },
+    /** `present` may be a boolean, or a function evaluated at each poll —
+     *  the latter models a button that only mounts after N attempts. */
+    setShopeeButtonPresent(tabId, present) {
+      state.shopeeButtonPresent[tabId] = typeof present === 'function' ? present : !!present;
+    },
     getScriptingCalls() { return [...state.scriptingCalls]; },
     /** Scripting calls whose injected function body contains `needle` —
      * e.g. 'el.click()' to count Shopee Main/Sub button click attempts. */

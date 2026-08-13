@@ -286,3 +286,33 @@ test('onUpdated auto-capture: proceeds hands-off once the marker is visible', as
     'the operator must see a banner confirmation, not a silently closing tab',
   );
 });
+
+// ── v2.7.3: the Main/Sub click must survive a late-rendering button ─────────
+// It used to mark itself done BEFORE knowing the click landed, so on a slow
+// render the click missed and never retried — stranding the operator on the
+// main-account form. Same act-once shape as the autofill and auth-check bugs.
+test('Shopee Main/Sub: a button that mounts late is still clicked (no burned one-shot)', async () => {
+  const harness = createHarness();
+  harness.install();
+  const bg = require('./background.js');
+  bg.TEST_TIMEOUTS.MAIN_SUB_POLL_INTERVAL_MS = 1;
+  bg.TEST_TIMEOUTS.MAIN_SUB_TIMEOUT_MS = 60;
+
+  // Button absent for the first two polls, then present.
+  let polls = 0;
+  harness.setShopeeButtonPresent(1, () => { polls += 1; return polls > 2; });
+
+  const clicked = await bg.clickShopeeMainSubLogin(1);
+  assert.equal(clicked, true, 'should keep polling until the button mounts');
+  assert.ok(polls >= 3, `expected repeated polls, saw ${polls}`);
+});
+
+test('Shopee Main/Sub: gives up at the deadline and reports false (never hangs)', async () => {
+  const harness = createHarness();
+  harness.install();
+  const bg = require('./background.js');
+  bg.TEST_TIMEOUTS.MAIN_SUB_POLL_INTERVAL_MS = 1;
+  bg.TEST_TIMEOUTS.MAIN_SUB_TIMEOUT_MS = 20;
+  harness.setShopeeButtonPresent(1, () => false);
+  assert.equal(await bg.clickShopeeMainSubLogin(1), false);
+});

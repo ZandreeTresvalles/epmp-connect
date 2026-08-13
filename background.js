@@ -68,6 +68,8 @@ const TEST_TIMEOUTS = {
   POST_CAPTURE_HYGIENE_DELAY_MS: 1700,
   DISCOVERY_POLL_INTERVAL_MS: 2500,
   DISCOVERY_MAX_ITERATIONS: 12,
+  MAIN_SUB_POLL_INTERVAL_MS: 500,
+  MAIN_SUB_TIMEOUT_MS: 8000,
 };
 
 // ── Page-state predicates → page-state.js ───────────────────────────────────
@@ -449,7 +451,25 @@ function isShopeeMainLoginPage(urlStr) {
   }
 }
 
-async function clickShopeeMainSubLogin(tabId) {
+async function clickShopeeMainSubLogin(tabId, opts) {
+  // Poll for the button instead of looking once. accounts.shopee.ph is a
+  // JS-rendered page like every other login surface here, so a single check on
+  // the tab's 'complete' event routinely runs before the button exists — the
+  // same act-once mistake that made autofill silently no-op (v2.6.4) and the
+  // auth check unreachable (v2.7.2). Bounded, never throws.
+  const o = opts || {};
+  const intervalMs = o.intervalMs || TEST_TIMEOUTS.MAIN_SUB_POLL_INTERVAL_MS;
+  const timeoutMs = o.timeoutMs || TEST_TIMEOUTS.MAIN_SUB_TIMEOUT_MS;
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (await clickShopeeMainSubLoginOnce(tabId)) return true;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return false;
+    await delay(Math.min(intervalMs, remaining));
+  }
+}
+
+async function clickShopeeMainSubLoginOnce(tabId) {
   try {
     const [res] = await chrome.scripting.executeScript({
       target: { tabId },
@@ -859,10 +879,19 @@ async function handleTabsOnUpdated(tabId, info, tab) {
   // linked directly. The click navigates, so autofill runs on the NEXT
   // 'complete' event (account.seller.shopee.com is allowed by
   // LOGIN_PAGE_PATTERNS.SHOPEE); returning here keeps this tick cheap.
-  if (ctx.platform === 'SHOPEE' && !ctx.mainSubClicked && isShopeeMainLoginPage(tab.url || '')) {
-    await setContext(tabId, { ...ctx, mainSubClicked: true });
+  if (ctx.platform === 'SHOPEE' && !ctx.mainSubClicked && !ctx.mainSubClickInFlight
+      && isShopeeMainLoginPage(tab.url || '')) {
+    // Claim an IN-FLIGHT slot (not the one-shot flag) before awaiting, so a
+    // second 'complete' can't start a parallel poll — but a poll that never
+    // finds the button leaves `mainSubClicked` UNSET, so a later event still
+    // gets a turn. Marking the attempt done before knowing it worked was the
+    // bug: on a slow render the click missed and the operator was stranded on
+    // the main-account form with no retry.
+    await setContext(tabId, { ...ctx, mainSubClickInFlight: true });
     const clicked = await clickShopeeMainSubLogin(tabId);
-    console.log(`[EPMP Connect] Shopee Main/Sub Account button: ${clicked ? 'clicked' : 'not found (operator can click it manually)'}`);
+    const after = (await getContext(tabId)) || ctx;
+    await setContext(tabId, { ...after, mainSubClickInFlight: false, mainSubClicked: clicked === true });
+    console.log(`[EPMP Connect] Shopee Main/Sub Account button: ${clicked ? 'clicked' : 'not found within the wait window (operator can click it manually; will retry on the next page event)'}`);
     if (clicked) return;
     ctx = (await getContext(tabId)) || ctx;
   }
