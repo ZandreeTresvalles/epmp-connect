@@ -15,6 +15,13 @@
  *     auto-capture attempt that didn't finish); the Capture Session button
  *     stays live so the operator can retry manually.
  *   - 'error'   — a capture attempt failed; message shown, button re-enabled.
+ *   - 'working' — capture is mid-flight (harvesting, product-list discovery,
+ *     upload). Live progress line, NO Capture button — a second click during
+ *     this window is exactly the double-capture the background's in-flight
+ *     guard exists to swallow. background.js re-pushes this state with fresh
+ *     elapsed-seconds text on every discovery poll tick, so the ~30s
+ *     product-list read (which deliberately RELOADS the page — the "stuck /
+ *     refreshing" report) visibly counts up instead of sitting frozen.
  *   - 'success' — a capture completed — from ANY path (auto-capture, this
  *     banner's own button, or the popup). Replaces the prompt with a green
  *     confirmation + a dismiss control. Pushed on EVERY successful capture
@@ -167,6 +174,25 @@ window.__epmpConnectShowBanner = function (platform, opts) {
     return node;
   }
 
+  function buildWorkingBar() {
+    const node = document.createElement('div');
+    node.style.cssText = barShellCss('linear-gradient(90deg,#475569,#3b82f6)');
+
+    const icon = document.createElement('span');
+    icon.style.fontSize = '15px';
+    icon.textContent = '⏳';
+
+    const text = document.createElement('span');
+    text.textContent = G.message || `Working — capturing your ${platformLabel} session…`;
+
+    // Deliberately NO Capture button (see the states doc above) and no
+    // dismiss: the whole point of this state is that something IS happening;
+    // it always resolves into success/notice/error within the capture's own
+    // timeout, which brings the controls back.
+    node.append(icon, text);
+    return node;
+  }
+
   function buildSuccessBar() {
     const node = document.createElement('div');
     node.style.cssText = barShellCss('linear-gradient(90deg,#16a34a,#22c55e)');
@@ -193,7 +219,9 @@ window.__epmpConnectShowBanner = function (platform, opts) {
   // explicit state push) — the bar has no input/focus state worth preserving,
   // so destroy-and-recreate is simpler and safer than patching a live node.
   if (already) already.remove();
-  const bar = G.state === 'success' ? buildSuccessBar() : buildDefaultBar();
+  const bar = G.state === 'success' ? buildSuccessBar()
+    : G.state === 'working' ? buildWorkingBar()
+    : buildDefaultBar();
   bar.id = BAR_ID;
   document.documentElement.appendChild(bar);
   // Nudge the page down so the banner never hides the login form.

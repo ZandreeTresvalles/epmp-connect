@@ -169,6 +169,14 @@ Broad registrable domains (matched with all subdomains):
 
 ## Versioning
 
+`2.4.0` — live capture progress: a new `working` banner state (⏳, no Capture
+button) narrates every slow phase of a capture — "capturing your session…",
+then "reading your product list… Ns (up to 30s)" counting up on each discovery
+poll tick, then "uploading to EPMP…" — before resolving into the existing
+success/notice/error states. Fixes the "after capture the site refreshes and
+gets stuck" report: the product-list discovery deliberately reloads the tab and
+polls for up to ~30 seconds, and previously showed nothing at all while it did.
+
 `2.3.0` — seller-login auto-fill: when a bridge-flow capture's `payload.login`
 carries `{ username, password }` (vended by EPMP's platform-accounts vault), the
 extension fills the username + password fields once the login tab lands on the

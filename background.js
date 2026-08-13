@@ -319,12 +319,16 @@ async function showBannerState(tabId, platform, state, message) {
 // interceptor.js (MAIN world) records product-list responses into
 // window.__epmpProductCapture. We navigate to productListUrl, poll for a hit,
 // and shape a { productEndpoint, sampleResponse } to attach to the upload.
-async function runDiscovery(tabId, productListUrl) {
+// `onProgress(elapsedSeconds)` fires each poll tick so the banner can count
+// up instead of freezing — this ~30s page-reload-then-wait is the exact
+// stretch operators reported as "the site refreshes and gets stuck".
+async function runDiscovery(tabId, productListUrl, onProgress) {
   if (!productListUrl) return { endpointStatus: null };
   try {
     await chrome.tabs.update(tabId, { url: productListUrl });
     for (let i = 0; i < 12; i++) {
       await delay(2500);
+      if (onProgress) { try { await onProgress(Math.round(((i + 1) * 2500) / 1000)); } catch { /* feedback only */ } }
       const [res] = await chrome.scripting.executeScript({
         target: { tabId },
         world: 'MAIN',
@@ -385,6 +389,12 @@ async function captureFromTab(tabId, ctxOverride) {
   const uploadUrl = resolveUploadUrl(ctx.uploadUrl || ctx.backendUrl);
   if (!uploadUrl) return { ok: false, error: 'No backend URL configured' };
 
+  // Live progress ('working' banner state) through every slow phase below.
+  // Best-effort feedback, never load-bearing: showBannerState already
+  // swallows injection failures, and capture must succeed banner or not.
+  const catalogLabel = `${PLATFORM_LABELS[ctx.platform] || ctx.platform} product list${ctx.brandName ? ` for ${ctx.brandName}` : ''}`;
+  showBannerState(tabId, ctx.platform, 'working', `Capturing your ${captureLabel(ctx)} session…`);
+
   const storageState = await buildStorageState(ctx.platform, tabId);
   if (!storageState.cookies.length) {
     return { ok: false, error: 'No cookies found — is the login complete?' };
@@ -393,12 +403,18 @@ async function captureFromTab(tabId, ctxOverride) {
   const body = { storageState };
   let endpointDiscovered = false;
   if (ctx.productListUrl) {
-    const disc = await runDiscovery(tabId, ctx.productListUrl);
+    showBannerState(
+      tabId, ctx.platform, 'working',
+      `Session captured — reading your ${catalogLabel}. The page reloads for this (normal); takes up to 30 seconds…`,
+    );
+    const disc = await runDiscovery(tabId, ctx.productListUrl, (elapsed) =>
+      showBannerState(tabId, ctx.platform, 'working', `Reading your ${catalogLabel}… ${elapsed}s (up to 30s)`));
     if (disc.endpointStatus) body.endpointStatus = disc.endpointStatus;
     if (disc.productEndpoint) { body.productEndpoint = disc.productEndpoint; endpointDiscovered = true; }
     if (disc.sampleResponse) body.sampleResponse = disc.sampleResponse;
   }
 
+  showBannerState(tabId, ctx.platform, 'working', `Uploading your ${captureLabel(ctx)} session to EPMP…`);
   await uploadSession(uploadUrl, ctx.token, body);
   await clearContext(tabId);
   return {
