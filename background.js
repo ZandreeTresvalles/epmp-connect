@@ -190,18 +190,165 @@ async function collectLocalStorage(tabId) {
   }
 }
 
-// Optionally clear a platform's cookies before login (epmp forceFreshLogin).
-async function clearPlatformCookies(platform) {
+// ── Post-capture hygiene (v2.5.0) ────────────────────────────────────────────
+// After EVERY successful capture — all three platforms, always on, no toggle
+// — the operator is deliberately logged out of the platform LOCALLY, so the
+// next brand's capture on this machine cannot silently reuse whichever
+// account happened to still be signed in. That's exactly how the wrong-shop
+// captures this plan responds to happened (one login, multiple brands, no
+// logout in between). Cookie deletion only: this code NEVER navigates to, or
+// fetches, a platform logout endpoint — that could invalidate the
+// server-side session token we just captured and uploaded.
+//
+// Runs from exactly one call site: the single uploadSession() success point
+// inside captureFromTab() below. A thrown/rejected upload never reaches this
+// code, so a failed capture/upload always leaves cookies and the tab
+// untouched — the operator can retry without re-login.
+//
+// Every step is independently best-effort and fail-open (its own try/catch):
+// a hygiene failure is logged to the service-worker console but never turns
+// a successful capture into a failure or blocks the return value.
+
+// Delete every cookie chrome.cookies.getAll() returns for the platform's
+// registrable domains. Deliberately reuses PLATFORM_COOKIE_DOMAINS (declared
+// above) rather than a second hardcoded list — it's already the code-level
+// mirror of manifest.json's host_permissions (kept in sync by convention, see
+// CLAUDE.md) and the exact domain set collectCookies() reads for this
+// platform, so "cookies we captured" and "cookies we wipe" can never drift
+// apart. chrome.cookies.getAll({domain}) matches the domain AND all
+// subdomains, so seller.*/accounts.*/sellercenter.* etc. are covered.
+// Also the implementation behind the pre-login forceFreshLogin wipe (the
+// former clearPlatformCookies was consolidated into this in v2.5.0).
+async function removeCookiesForPlatform(platform) {
   const domains = PLATFORM_COOKIE_DOMAINS[platform] || [];
+  const seen = new Set();
+  let removed = 0;
+  let failed = 0;
+
   for (const domain of domains) {
     let cookies = [];
-    try { cookies = await chrome.cookies.getAll({ domain }); } catch { /* ignore */ }
-    for (const c of cookies) {
-      const scheme = c.secure ? 'https' : 'http';
-      const host = c.domain.startsWith('.') ? c.domain.slice(1) : c.domain;
-      const url = `${scheme}://${host}${c.path || '/'}`;
-      try { await chrome.cookies.remove({ url, name: c.name, storeId: c.storeId }); } catch { /* ignore */ }
+    try {
+      cookies = await chrome.cookies.getAll({ domain });
+    } catch {
+      failed += 1;
+      continue;
     }
+
+    for (const c of cookies) {
+      const key = `${c.name}|${c.domain}|${c.path}|${c.storeId}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      // Reconstruct the removal URL: https:// + domain with any leading dot
+      // stripped + path. Always https — Chrome only matches a Secure cookie
+      // against an https:// removal URL, and every platform here is
+      // https-only anyway, so this covers secure cookies without excluding
+      // non-secure ones.
+      const host = c.domain.startsWith('.') ? c.domain.slice(1) : c.domain;
+      const details = { url: `https://${host}${c.path || '/'}`, name: c.name, storeId: c.storeId };
+
+      try {
+        if (c.partitionKey) {
+          // Partitioned (CHIPS) cookie — pass partitionKey through so the
+          // right partition is targeted. Some Chrome/cookies-API versions
+          // reject an unrecognized partitionKey field on remove(); retry
+          // without it rather than counting that as a real failure.
+          try {
+            await chrome.cookies.remove({ ...details, partitionKey: c.partitionKey });
+            removed += 1;
+            continue;
+          } catch {
+            /* fall through to the unpartitioned retry below */
+          }
+        }
+        await chrome.cookies.remove(details);
+        removed += 1;
+      } catch {
+        failed += 1;
+      }
+    }
+  }
+
+  return { removed, failed };
+}
+
+// Fallback "what tab was the operator probably looking at" when no explicit
+// originating tab is known (the popup and banner-button capture paths never
+// open a separate tab, so there's nothing to remember there). Derived from
+// bridge.js's own content-script match patterns in the manifest — the known
+// frontend origins — rather than a second hardcoded URL list.
+function frontendOriginPatterns() {
+  try {
+    const scripts = chrome.runtime.getManifest().content_scripts || [];
+    const bridgeEntry = scripts.find((cs) => (cs.js || []).includes('bridge.js'));
+    return (bridgeEntry && bridgeEntry.matches) || [];
+  } catch {
+    return [];
+  }
+}
+
+async function findFallbackOriginTab() {
+  const patterns = frontendOriginPatterns();
+  if (!patterns.length) return null;
+  try {
+    const tabs = await chrome.tabs.query({ url: patterns });
+    if (!tabs.length) return null;
+    // Most-recently-active first when the field is available (Chrome 121+);
+    // otherwise query() order is a good enough guess — this is a fallback,
+    // never a guarantee.
+    tabs.sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0));
+    return tabs[0];
+  } catch {
+    return null;
+  }
+}
+
+// Refocus the tab that kicked off this capture (bridge flow: ctx.originTabId)
+// or, failing that, the most recently active known frontend tab. No-ops if
+// neither is available — the plan's "fail-open" contract: worst case, nothing
+// is focused.
+async function refocusOriginTab(ctx) {
+  let originTab = null;
+  if (ctx.originTabId) {
+    try { originTab = await chrome.tabs.get(ctx.originTabId); } catch { originTab = null; }
+  }
+  if (!originTab) originTab = await findFallbackOriginTab();
+  if (!originTab) return;
+  await chrome.tabs.update(originTab.id, { active: true });
+  await chrome.windows.update(originTab.windowId, { focused: true });
+}
+
+// The orchestration: tell the operator, wipe cookies, close the tab, refocus.
+// Order matters for the banner message — it must be pushed (and briefly
+// visible) BEFORE the tab closes underneath it.
+async function runPostCaptureHygiene(tabId, ctx) {
+  const platform = ctx.platform;
+  const label = PLATFORM_LABELS[platform] || platform;
+  const message = `Captured ✓ — you've been logged out of ${label} so the next brand starts from a clean login.`;
+
+  // Brief — the flow should still feel fast. showBannerState already
+  // swallows a failure (tab already gone/navigated) via its own try/catch.
+  await showBannerState(tabId, platform, 'success', message).catch(() => {});
+  await delay(1700);
+
+  try {
+    const { removed, failed } = await removeCookiesForPlatform(platform);
+    console.log(`[EPMP Connect] post-capture hygiene: removed ${removed} ${label} cookie(s)`
+      + (failed ? `, ${failed} failed` : ''));
+  } catch (e) {
+    console.warn('[EPMP Connect] post-capture hygiene: cookie wipe threw', e);
+  }
+
+  try {
+    await chrome.tabs.remove(tabId);
+  } catch (e) {
+    console.warn('[EPMP Connect] post-capture hygiene: failed to close capture tab', e);
+  }
+
+  try {
+    await refocusOriginTab(ctx);
+  } catch (e) {
+    console.warn('[EPMP Connect] post-capture hygiene: failed to refocus originating tab', e);
   }
 }
 
@@ -417,16 +564,35 @@ async function captureFromTab(tabId, ctxOverride) {
   showBannerState(tabId, ctx.platform, 'working', `Uploading your ${captureLabel(ctx)} session to EPMP…`);
   await uploadSession(uploadUrl, ctx.token, body);
   await clearContext(tabId);
-  return {
+
+  const result = {
     ok: true,
     cookieCount: storageState.cookies.length,
     endpointDiscovered,
     label: captureLabel(ctx),
   };
+
+  // Post-capture hygiene (v2.5.0, see runPostCaptureHygiene above) — this is
+  // the exact success point: uploadSession() above already resolved without
+  // throwing, so a failed upload/capture never reaches here and never
+  // touches cookies or the tab. Awaited so cookie-wipe/tab-close finish
+  // before this promise resolves, but its own fail-open contract means it
+  // can never turn `result` into a failure.
+  await runPostCaptureHygiene(tabId, ctx).catch((e) => {
+    console.warn('[EPMP Connect] post-capture hygiene rejected unexpectedly', e);
+  });
+
+  return result;
 }
 
 // ── Start a bridge-initiated capture (open login tab + banner) ───────────────
-async function startCapture(payload) {
+// originTabId (v2.5.0): the tab that sent the 'capture'/'REQUEST_CAPTURE'
+// message, i.e. the project web app's own tab — NOT the new platform login
+// tab created below. Stored on the capture context so post-capture hygiene
+// can refocus it once the capture succeeds. Only the bridge flow has this;
+// the popup and banner-button flows capture whatever tab the operator is
+// already looking at, so there's no separate "originating" tab to remember.
+async function startCapture(payload, originTabId) {
   // Normalize the two frontend dialects into one context.
   const platform = String(payload.platform || '').toUpperCase();
   const token = payload.token || payload.captureToken;
@@ -440,7 +606,7 @@ async function startCapture(payload) {
   if (!loginUrl) return { ok: false, error: 'Missing login URL' };
   if (!resolveUploadUrl(uploadUrl)) return { ok: false, error: 'Missing backend URL' };
 
-  if (forceFreshLogin) await clearPlatformCookies(platform);
+  if (forceFreshLogin) await removeCookiesForPlatform(platform);
 
   // Optional platform-accounts vend (EPMP): { username, password } for
   // seller-login auto-fill on the login tab. Validated defensively — never
@@ -453,6 +619,7 @@ async function startCapture(payload) {
   const tab = await chrome.tabs.create({ url: loginUrl });
   await setContext(tab.id, {
     platform, token, uploadUrl, loginUrl, productListUrl, brandId, brandName, login: safeLogin,
+    originTabId: originTabId || null,
   });
   // Banner is (re)injected by the onUpdated listener once the tab finishes loading.
   return { ok: true, started: true, tabId: tab.id };
@@ -569,8 +736,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   // Bridge-initiated capture (epmp 'capture' / ReportBot 'REQUEST_CAPTURE').
+  // sender.tab is set automatically because bridge.js is a content script —
+  // it's the web-app tab that ASKED for this capture, distinct from the new
+  // platform login tab startCapture() is about to open. Stashed as
+  // originTabId so post-capture hygiene can refocus it later.
   if (type === 'capture' || type === 'REQUEST_CAPTURE') {
-    startCapture(msg.payload || {})
+    startCapture(msg.payload || {}, sender?.tab?.id)
       .then(sendResponse)
       .catch((e) => sendResponse({ ok: false, error: String(e?.message || e) }));
     return true;

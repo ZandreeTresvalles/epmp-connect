@@ -169,6 +169,21 @@ Broad registrable domains (matched with all subdomains):
 
 ## Versioning
 
+`2.5.0` — post-capture hygiene (auto-logout): after every successful capture,
+on all three platforms, the extension deliberately logs the operator out of
+that platform **locally** — cookie deletion via `chrome.cookies` only, never a
+logout request (which could invalidate the session token just captured) —
+then closes the capture tab and refocuses whichever tab kicked off the
+capture (the bridge flow's originating web-app tab, or, if that's unknown,
+the most recently active known frontend tab). The banner shows "Captured ✓ —
+you've been logged out of {platform} so the next brand starts from a clean
+login." before the tab closes. Fixes the class of wrong-shop captures where
+two brands got captured back-to-back under one still-logged-in seller account
+with no logout in between. Always on, no toggle, and fail-open throughout: a
+hygiene step that fails is logged but never fails the capture, and a failed
+capture/upload leaves cookies and the tab untouched so the operator can retry
+without re-login.
+
 `2.4.0` — live capture progress: a new `working` banner state (⏳, no Capture
 button) narrates every slow phase of a capture — "capturing your session…",
 then "reading your product list… Ns (up to 30s)" counting up on each discovery
