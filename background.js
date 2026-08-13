@@ -272,6 +272,110 @@ async function removeCookiesForPlatform(platform) {
   return { removed, failed };
 }
 
+// ── Full site-data wipe (v2.6.0) — pre-login hard guard ─────────────────────
+// removeCookiesForPlatform (above) only clears cookies. Some platforms persist
+// an auth/refresh token in localStorage/IndexedDB, which can silently
+// resurrect a session even after every cookie for the domain is gone — that's
+// exactly how the wrong-shop capture incident this feature responds to
+// happened (operator still logged into Brand A's Shopee at the storage
+// level; clicking Connect for Brand B opened the login URL already
+// authenticated). wipePlatformSiteData clears BOTH: cookies via
+// removeCookiesForPlatform, PLUS localStorage, IndexedDB, Service Workers,
+// Cache Storage and the HTTP cache via chrome.browsingData.remove.
+//
+// chrome.browsingData.remove's `origins` filter is an EXACT-origin match —
+// unlike chrome.cookies.getAll({domain}), it does NOT walk subdomains. A bare
+// `https://shopee.ph` origin does not reach `https://seller.shopee.ph`'s
+// localStorage. siteDataOriginsForPlatform() below enumerates the known
+// seller/accounts/sellercenter/sub-account hosts per registrable domain to
+// cover that gap, but any origin this list doesn't anticipate (a login
+// variant we haven't seen, a regional mirror, etc.) would still be missed by
+// this call alone — that coverage is inherently uncertain, since an exact-origin
+// list can never guarantee it has every host a seller might be logged into.
+// Belt-and-suspenders: startCapture() also has the login tab itself run
+// clearTabStorage() once it loads (see the onUpdated listener below), which
+// clears whatever the ACTUAL origin turns out to be — no enumeration
+// required there. Both approaches are shipped; neither alone is treated as
+// sufficient.
+//
+// Every failure is caught, logged, and swallowed here — this function must
+// NEVER throw, and a wipe failure must never block the login tab from
+// opening (enforced by the caller in startCapture()).
+const SITE_DATA_ORIGIN_PREFIXES = ['', 'www.', 'seller.', 'accounts.', 'sellercenter.'];
+
+// Known real hosts that don't fit the mechanical prefix pattern above —
+// Shopee's sub-account login lives on a different second-level domain
+// (`subaccount.shopee.com`, not `*.shopee.ph`), and TikTok's PH seller host
+// is `seller-ph.`, not `seller.`.
+const EXTRA_SITE_DATA_HOSTS = {
+  SHOPEE: ['subaccount.shopee.com'],
+  LAZADA: [],
+  TIKTOK: ['seller-ph.tiktok.com'],
+};
+
+function siteDataOriginsForPlatform(platform) {
+  const domains = PLATFORM_COOKIE_DOMAINS[platform] || [];
+  const origins = new Set();
+  for (const domain of domains) {
+    for (const prefix of SITE_DATA_ORIGIN_PREFIXES) {
+      origins.add(`https://${prefix}${domain}`);
+    }
+  }
+  for (const host of EXTRA_SITE_DATA_HOSTS[platform] || []) {
+    origins.add(`https://${host}`);
+  }
+  return Array.from(origins);
+}
+
+async function wipePlatformSiteData(platform) {
+  let cookieResult = { removed: 0, failed: 0 };
+  try {
+    cookieResult = await removeCookiesForPlatform(platform);
+  } catch (e) {
+    console.warn(`[EPMP Connect] site-data wipe: cookie removal threw for ${platform}`, e);
+  }
+
+  const origins = siteDataOriginsForPlatform(platform);
+  let browsingDataOk = false;
+  try {
+    await chrome.browsingData.remove(
+      { origins },
+      {
+        localStorage: true,
+        indexedDB: true,
+        serviceWorkers: true,
+        cacheStorage: true,
+        cache: true,
+      },
+    );
+    browsingDataOk = true;
+  } catch (e) {
+    console.warn(`[EPMP Connect] site-data wipe: browsingData.remove threw for ${platform}`, e);
+  }
+
+  return { ...cookieResult, browsingDataOk, origins };
+}
+
+// Belt-and-suspenders companion to wipePlatformSiteData's origin enumeration:
+// runs directly inside the login tab once it has actually loaded, clearing
+// whatever origin the tab REALLY landed on — no guessing which subdomain a
+// given seller's session lives on. Best-effort: an injection failure (CSP,
+// tab navigated away mid-injection) is swallowed — it must never block the
+// rest of the caller.
+async function clearTabStorage(tabId) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        try { localStorage.clear(); } catch { /* storage blocked */ }
+        try { sessionStorage.clear(); } catch { /* storage blocked */ }
+      },
+    });
+  } catch (e) {
+    console.warn('[EPMP Connect] clearTabStorage: injection failed', e);
+  }
+}
+
 // Fallback "what tab was the operator probably looking at" when no explicit
 // originating tab is known (the popup and banner-button capture paths never
 // open a separate tab, so there's nothing to remember there). Derived from
@@ -597,7 +701,10 @@ async function startCapture(payload, originTabId) {
   const platform = String(payload.platform || '').toUpperCase();
   const token = payload.token || payload.captureToken;
   const uploadUrl = payload.uploadUrl || payload.backendUrl;
-  const { loginUrl, productListUrl, forceFreshLogin, brandId, brandName, login } = payload;
+  // `forceFreshLogin` is still accepted on the payload for back-compat (some
+  // callers may still send it), but as of v2.6.0 it is no longer
+  // load-bearing — see the unconditional wipe below.
+  const { loginUrl, productListUrl, forceFreshLogin: _forceFreshLoginUnused, brandId, brandName, login } = payload;
 
   if (!platform || !PLATFORM_COOKIE_DOMAINS[platform]) {
     return { ok: false, error: `Invalid platform: ${payload.platform}` };
@@ -606,7 +713,18 @@ async function startCapture(payload, originTabId) {
   if (!loginUrl) return { ok: false, error: 'Missing login URL' };
   if (!resolveUploadUrl(uploadUrl)) return { ok: false, error: 'Missing backend URL' };
 
-  if (forceFreshLogin) await removeCookiesForPlatform(platform);
+  // Hard guard (v2.6.0): clicking Connect must ALWAYS start from a
+  // logged-out platform — cookies AND site storage/cache wiped BEFORE the
+  // login tab opens, every platform, no exceptions. This used to be
+  // conditional on `forceFreshLogin`, which the web app never actually sent
+  // (that gap is exactly how the wrong-shop capture incident happened — see
+  // wipePlatformSiteData's own header comment). A wipe failure is logged and
+  // NEVER blocks the login tab from opening; wipePlatformSiteData already
+  // swallows its own internal failures, so this catch only guards against an
+  // unexpected rejection of the wrapper promise itself.
+  await wipePlatformSiteData(platform).catch((e) => {
+    console.warn(`[EPMP Connect] startCapture: site-data wipe rejected unexpectedly for ${platform}`, e);
+  });
 
   // Optional platform-accounts vend (EPMP): { username, password } for
   // seller-login auto-fill on the login tab. Validated defensively — never
@@ -660,6 +778,21 @@ chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
   if (info.status !== 'complete') return;
   let ctx = await getContext(tabId);
   if (!ctx) return;
+
+  // Belt-and-suspenders for startCapture()'s pre-open wipePlatformSiteData
+  // call: clear whatever the tab's ACTUAL origin turns out to be, once,
+  // before banner injection / login-autofill / auto-capture-detection get a
+  // chance to act on a page that might still read a stale session out of
+  // localStorage/sessionStorage. Only fires for tabs startCapture() created
+  // (ctx only exists for those — the banner/popup capture-current-tab flows
+  // never call setContext for a fresh tab, so they're structurally excluded)
+  // and only once we're actually on a real http(s) page (skip about:blank /
+  // interstitials during the tab's initial navigation).
+  if (!ctx.siteStorageCleared && /^https?:/i.test(tab.url || '')) {
+    await clearTabStorage(tabId);
+    ctx = { ...ctx, siteStorageCleared: true };
+    await setContext(tabId, ctx);
+  }
 
   injectBanner(tabId, ctx.platform);
 

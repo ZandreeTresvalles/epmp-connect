@@ -154,6 +154,7 @@ token minted by the backend's Sessions page.
 | `tabs` | Open and track the login tab |
 | `activeTab` | Capture the current tab from the popup |
 | `storage` | Persist the popup's backend URL + per-tab capture context |
+| `browsingData` | Clear localStorage/IndexedDB/Service Workers/Cache Storage/cache for the platform's known origins before a bridge-flow login tab opens (v2.6.0 fresh-login hard guard) |
 | host: `*.shopee.ph`, `*.shopee.com`, `*.lazada.com.ph`, `*.lazada.com`, `*.tiktok.com`, `*.tiktokshop.com` | Scoped to the three platforms — never `<all_urls>` |
 
 `bridge.js` runs only on the listed frontend origins, so no other site can drive
@@ -168,6 +169,32 @@ Broad registrable domains (matched with all subdomains):
 - **TikTok:** `tiktok.com`, `tiktokshop.com`
 
 ## Versioning
+
+`2.6.0` — fresh-capture hard guard (pre-login wipe): the bridge flow's
+`startCapture()` — the flow that opens a NEW platform login tab, never the
+banner/popup "capture the tab I'm already looking at" flows — now
+**unconditionally** wipes that platform's cookies AND site storage/cache
+*before* the login tab opens, on all three platforms, every time. Previously
+this only ran when the caller's payload set `forceFreshLogin`, and no caller
+ever actually set it — so an operator still logged into Brand A's Shopee who
+clicked Connect for Brand B got a login tab that was already authenticated as
+Brand A, and captured the wrong shop's session under the wrong brand. The
+payload flag is still accepted for back-compat but is no longer load-bearing.
+Two wipes run together: `wipePlatformSiteData()` = the existing
+`removeCookiesForPlatform()` (cookies) PLUS `chrome.browsingData.remove()`
+(localStorage, IndexedDB, Service Workers, Cache Storage, and the HTTP cache)
+scoped to that platform's known seller/accounts/sellercenter/sub-account
+origins — `browsingData`'s `origins` filter matches an EXACT origin, not a
+subdomain wildcard, so those hosts are enumerated explicitly rather than
+relying on the bare registrable domain. Because an exact-origin list can never
+guarantee full coverage of every host a seller might be logged into, the login
+tab itself also runs a direct `localStorage.clear()` + `sessionStorage.clear()`
+once it loads (`clearTabStorage()`, once per tab, before the banner/autofill/
+auto-capture logic gets a chance to run) — this clears whatever the ACTUAL
+origin turns out to be, no enumeration required. Both wipes are fail-open: any
+failure is logged to the service-worker console and never blocks the login tab
+from opening. New `browsingData` manifest permission (accepted cost — this is
+an unpacked install, not the Web Store).
 
 `2.5.0` — post-capture hygiene (auto-logout): after every successful capture,
 on all three platforms, the extension deliberately logs the operator out of
