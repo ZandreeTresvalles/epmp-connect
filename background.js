@@ -108,8 +108,21 @@ const LOGIN_PATH = /(\/(login|signin|sign-in|passport|account\/login))/i;
 
 const LOGIN_PAGE_PATTERNS = {
   LAZADA: (u) => /(^|\.)sellercenter\.lazada\.com\.ph$/.test(u.hostname) && LOGIN_PATH.test(u.pathname),
-  SHOPEE: (u) => /(^|\.)subaccount\.shopee\.com$/.test(u.hostname)
-    && (u.pathname === '/' || LOGIN_PATH.test(u.pathname)),
+  // Two Shopee login surfaces, both real (probed live 2026-08-13):
+  //   subaccount.shopee.com/login/           — the Sub-account Platform form
+  //   account.seller.shopee.com/signin/…     — the unified "Main / Sub Account
+  //                                            Login" OAuth form, which Shopee
+  //                                            mints (freshly SIGNED) when the
+  //                                            "Login with Main/Sub Account"
+  //                                            button on accounts.shopee.ph is
+  //                                            clicked — see
+  //                                            clickShopeeMainSubLogin below.
+  // Both render `input.shopee-input__input` text+password fields, which is
+  // exactly what login-fill.js's SHOPEE selector already targets, so allowing
+  // the second host here is all autofill needs to work on the OAuth form.
+  SHOPEE: (u) => (/(^|\.)subaccount\.shopee\.com$/.test(u.hostname)
+      && (u.pathname === '/' || LOGIN_PATH.test(u.pathname)))
+    || (/(^|\.)account\.seller\.shopee\.com$/.test(u.hostname) && LOGIN_PATH.test(u.pathname)),
   TIKTOK: (u) => /(^|\.)tiktok\.com$/.test(u.hostname) && LOGIN_PATH.test(u.pathname),
 };
 
@@ -443,6 +456,59 @@ async function fillLoginFields(tabId, platform, username, password) {
   }
 }
 
+// ── Shopee: steer to the Main/Sub Account login (v2.6.3) ────────────────────
+// Shopee's seller login (accounts.shopee.ph/seller/login) defaults to the
+// MAIN-account form (`input[name=loginKey]`), but this org logs in with
+// SUB-accounts (e.g. `arlaph.dataccess`). That page carries a
+// "Login with Main/Sub Account" button which navigates to Shopee's unified
+// OAuth form at account.seller.shopee.com — placeholder
+// "Main/subaccount name/phone/email", hint "input main/subaccount login name
+// 'XXX:main'" — whose redirect_uri establishes a real Seller Centre session.
+//
+// That OAuth URL CANNOT be linked to directly: it carries `sign`, `timestamp`
+// and `max_auth_age=600`, i.e. Shopee signs it per-request and it expires in
+// ~10 minutes (probed: stripping those params returns
+// "400 Error Param: ClientId/Scope/RedirectUri required"). Clicking Shopee's
+// own button is therefore the only durable way to reach it — Shopee mints a
+// fresh signed URL each time.
+//
+// SCOPE: this clicks ONE navigation button on the operator's own login page.
+// It never types, submits, or reads credentials — the "fill only, never
+// auto-submit" contract is untouched. One-shot per tab (ctx.mainSubClicked)
+// so a failed click can never loop, and entirely fail-open: if the button is
+// absent or the click throws, the operator simply stays on the page they can
+// still use by hand.
+const SHOPEE_MAIN_SUB_BUTTON_RE = /login with main\s*\/?\s*sub account/i;
+
+function isShopeeMainLoginPage(urlStr) {
+  try {
+    const u = new URL(urlStr);
+    return /(^|\.)accounts\.shopee\.[a-z.]+$/i.test(u.hostname) && /\/seller\/login/i.test(u.pathname);
+  } catch {
+    return false;
+  }
+}
+
+async function clickShopeeMainSubLogin(tabId) {
+  try {
+    const [res] = await chrome.scripting.executeScript({
+      target: { tabId },
+      args: [SHOPEE_MAIN_SUB_BUTTON_RE.source],
+      func: (reSrc) => {
+        const re = new RegExp(reSrc, 'i');
+        const el = Array.from(document.querySelectorAll('button, a, [role="button"]'))
+          .find((e) => re.test((e.textContent || '').replace(/\s+/g, ' ').trim()));
+        if (!el) return false;
+        el.click();
+        return true;
+      },
+    });
+    return Boolean(res && res.result);
+  } catch {
+    return false; // tab navigated away / CSP / no permission — best-effort.
+  }
+}
+
 // Called from the onUpdated listener below whenever a tracked tab carries a
 // still-live `login` and finishes loading. No-ops immediately (and cheaply)
 // unless the tab is actually on the platform's login page.
@@ -754,6 +820,20 @@ chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
   if (!ctx) return;
 
   injectBanner(tabId, ctx.platform);
+
+  // Shopee only (v2.6.3): if we've landed on the MAIN seller login, click
+  // through to the Main/Sub Account form once — this org logs in with
+  // sub-accounts. See clickShopeeMainSubLogin for why the OAuth URL can't be
+  // linked directly. The click navigates, so autofill runs on the NEXT
+  // 'complete' event (account.seller.shopee.com is allowed by
+  // LOGIN_PAGE_PATTERNS.SHOPEE); returning here keeps this tick cheap.
+  if (ctx.platform === 'SHOPEE' && !ctx.mainSubClicked && isShopeeMainLoginPage(tab.url || '')) {
+    await setContext(tabId, { ...ctx, mainSubClicked: true });
+    const clicked = await clickShopeeMainSubLogin(tabId);
+    console.log(`[EPMP Connect] Shopee Main/Sub Account button: ${clicked ? 'clicked' : 'not found (operator can click it manually)'}`);
+    if (clicked) return;
+    ctx = (await getContext(tabId)) || ctx;
+  }
 
   // Seller-login auto-fill: independent of the auto-capture flow below (it
   // targets the LOGIN page, auto-capture targets the DASHBOARD page — the

@@ -175,6 +175,23 @@ Broad registrable domains (matched with all subdomains):
 
 ## Versioning
 
+`2.6.3` — steer Shopee captures to the **Main / Sub Account** login. Shopee's
+seller login defaults to the main-account form (`input[name=loginKey]`), but
+brands connect through SUB-accounts (e.g. `arlaph.dataccess`). That page has a
+**"Login with Main/Sub Account"** button which navigates to Shopee's unified
+OAuth form at `account.seller.shopee.com` (placeholder "Main/subaccount
+name/phone/email"), whose `redirect_uri` establishes a real Seller Centre
+session. That OAuth URL cannot be linked directly — it carries `sign`,
+`timestamp` and `max_auth_age=600`, so Shopee signs it per request and it
+expires in ~10 minutes (probed: stripping the params returns "400 Error Param:
+ClientId/Scope/RedirectUri required"). The extension therefore clicks Shopee's
+own button, one-shot per tab and fail-open: if the button isn't found the
+operator just uses the page by hand. `LOGIN_PAGE_PATTERNS.SHOPEE` now also
+matches `account.seller.shopee.com`, so vault autofill fires on the OAuth form
+(its `input.shopee-input__input` fields are exactly what the existing SHOPEE
+selector targets). This clicks one navigation button only — it never types,
+submits, or reads credentials.
+
 `2.6.2` — refuse to capture an unauthenticated session. The only pre-upload
 check was `storageState.cookies.length > 0`, but Shopee/Lazada set cookies on
 their login/verification pages too — so a capture whose login never completed
