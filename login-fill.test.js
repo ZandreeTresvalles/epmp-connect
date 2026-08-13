@@ -2,11 +2,22 @@
  * Unit tests for the pure DOM-picking logic in login-fill.js.
  *
  * No jsdom / bundler available in this repo (see CLAUDE.md: no build/test
- * step), so we simulate `document.querySelectorAll` with a tiny fake `doc`
- * whose elements are plain objects exposing just what pickLoginFields()
- * touches: getBoundingClientRect() and offsetParent. That's enough to
- * exercise every branch (0 / 1 / >1 visible matches; hidden elements
- * filtered out) without a real DOM.
+ * step), so we simulate `document.querySelectorAll` with two tiny fake
+ * `doc` shapes:
+ *   - fakeDoc: a selector-string -> elements map, for tests that only care
+ *     about the exact selector reaching querySelectorAll() (most cases).
+ *   - fakeAttrDoc (v2.6.1): actually parses a comma-joined selector into its
+ *     `input[attr(*)="value" i?]` fragments and matches each against an
+ *     element's attribute-shaped properties — needed for TikTok's broadened,
+ *     multi-alternative username selector, where a fixture must demonstrate
+ *     it's caught by ONE SPECIFIC alternative (e.g. only `placeholder`, not
+ *     `type`/`name`), which a plain string-keyed map can't express since the
+ *     real code always queries the whole comma list in a single call.
+ * Elements are plain objects exposing just what pickLoginFields() touches:
+ * getBoundingClientRect(), offsetParent, and (for fakeAttrDoc) plain
+ * attribute-named properties like `type`/`name`/`placeholder`/`autocomplete`.
+ * That's enough to exercise every branch (0 / 1 / >1 visible matches; hidden
+ * elements filtered out) without a real DOM.
  *
  * Run: node --test login-fill.test.js
  */
@@ -14,7 +25,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { pickLoginFields } = require('./login-fill.js');
+const { pickLoginFields, buildLoginSelectors } = require('./login-fill.js');
 
 function visibleEl(extra) {
   return Object.assign(
@@ -39,6 +50,38 @@ function fakeDoc(bySelector) {
   return {
     querySelectorAll(selector) {
       return bySelector[selector] || [];
+    },
+  };
+}
+
+// TIKTOK's username selector (see buildLoginSelectors() in login-fill.js) is
+// a single comma-joined list of alternatives, and pickSingle() always passes
+// that WHOLE string to querySelectorAll() in one call — never one
+// alternative at a time. A `fakeDoc` keyed by exact selector string (above)
+// can't exercise "this element matches ONLY the placeholder alternative,
+// not the others" because the real call never queries a lone alternative in
+// isolation. fakeAttrDoc actually parses the comma list and evaluates each
+// `input[attr(*)="value" i?]` fragment against each element's own
+// attribute-shaped properties, the same way a real browser evaluates a
+// grouped CSS selector — so these tests genuinely exercise which broadened
+// alternative caught a given fixture, not just whether the plumbing passes
+// a string through.
+function elementMatchesSelectorPart(el, part) {
+  const m = /^input\[([a-zA-Z]+)(\*=|=)"([^"]+)"(?:\s+i)?\]$/.exec(part.trim());
+  if (!m) return false;
+  const [, attr, op, value] = m;
+  const actual = el[attr];
+  if (actual == null) return false;
+  const a = String(actual).toLowerCase();
+  const v = value.toLowerCase();
+  return op === '*=' ? a.includes(v) : a === v;
+}
+
+function fakeAttrDoc(elements) {
+  return {
+    querySelectorAll(selector) {
+      const parts = selector.split(',').map((s) => s.trim());
+      return elements.filter((el) => parts.some((p) => elementMatchesSelectorPart(el, p)));
     },
   };
 }
@@ -68,15 +111,80 @@ test('SHOPEE: exactly one visible match for each field -> both picked', () => {
 });
 
 test('TIKTOK: exactly one visible match for each field -> both picked', () => {
+  const tiktokSel = buildLoginSelectors().TIKTOK;
   const username = visibleEl({ tag: 'username' });
   const password = visibleEl({ tag: 'password' });
   const doc = fakeDoc({
-    'input[type="text"], input[type="email"]': [username],
-    'input[type="password"]': [password],
+    [tiktokSel.username]: [username],
+    [tiktokSel.password]: [password],
   });
   const { usernameEl, passwordEl } = pickLoginFields(doc, 'TIKTOK');
   assert.equal(usernameEl, username);
   assert.equal(passwordEl, password);
+});
+
+// v2.6.1: TikTok's account-login page selector was broadened beyond plain
+// type="text"/type="email" to also match on name/placeholder/autocomplete
+// tokens (see buildLoginSelectors() in login-fill.js). These fixtures give
+// the username element ONLY a `placeholder` (or only a `name`) — no `type`
+// of "text"/"email" and no other matching attribute — so they only pass if
+// pickSingle() is actually catching it via one of the newly-added
+// alternatives, not the original two type-based ones.
+test('TIKTOK: email field matched only by placeholder token is still picked', () => {
+  // A plausible real-world shape: a plain <input placeholder="Email address">
+  // with no type/name/autocomplete signal at all.
+  const username = visibleEl({ placeholder: 'Email address' });
+  const password = visibleEl({ type: 'password' });
+  const doc = fakeAttrDoc([username, password]);
+  const { usernameEl, passwordEl } = pickLoginFields(doc, 'TIKTOK');
+  assert.equal(usernameEl, username);
+  assert.equal(passwordEl, password);
+});
+
+test('TIKTOK: email field matched only by name token is still picked', () => {
+  const username = visibleEl({ name: 'email' });
+  const password = visibleEl({ type: 'password' });
+  const doc = fakeAttrDoc([username, password]);
+  const { usernameEl, passwordEl } = pickLoginFields(doc, 'TIKTOK');
+  assert.equal(usernameEl, username);
+  assert.equal(passwordEl, password);
+});
+
+test('TIKTOK: password field selector is untouched by the broadening (type="password" only)', () => {
+  // Sanity check on the security contract: even though the username side now
+  // matches many attribute shapes, the password selector must still be
+  // exactly 'input[type="password"]' — an element that merely LOOKS like a
+  // password field by name/placeholder (but isn't type="password") must
+  // never be picked as the password field.
+  const tiktokSel = buildLoginSelectors().TIKTOK;
+  assert.equal(tiktokSel.password, 'input[type="password"]');
+  const decoy = visibleEl({ name: 'password', placeholder: 'Password' }); // no type="password"
+  const doc = fakeAttrDoc([decoy]);
+  const { passwordEl } = pickLoginFields(doc, 'TIKTOK');
+  assert.equal(passwordEl, null);
+});
+
+// Simulates the "loads late" concern from the v2.6.1 task: the login-page
+// document initially has no matching inputs at all (form not mounted yet —
+// the first onUpdated 'complete' event fires before the SPA renders it),
+// then a second attempt against the SAME platform, once the form has
+// mounted, successfully picks both fields. This exercises pickLoginFields()
+// being called twice against two different `doc` snapshots, mirroring what
+// attemptLoginFill()'s LOGIN_FILL_MAX_ATTEMPTS retry does in background.js —
+// pickLoginFields itself has no memory of a "previous attempt", so a
+// late-mounted form is only ever a matter of what the second `doc` contains.
+test('TIKTOK: late-mounted form — first attempt empty, second attempt (fresh doc) picks both', () => {
+  const emptyDoc = fakeAttrDoc([]); // form not mounted yet: nothing to match
+  const firstAttempt = pickLoginFields(emptyDoc, 'TIKTOK');
+  assert.equal(firstAttempt.usernameEl, null);
+  assert.equal(firstAttempt.passwordEl, null);
+
+  const username = visibleEl({ autocomplete: 'username' });
+  const password = visibleEl({ type: 'password' });
+  const mountedDoc = fakeAttrDoc([username, password]);
+  const secondAttempt = pickLoginFields(mountedDoc, 'TIKTOK');
+  assert.equal(secondAttempt.usernameEl, username);
+  assert.equal(secondAttempt.passwordEl, password);
 });
 
 test('zero visible matches -> field skipped, never guessed', () => {

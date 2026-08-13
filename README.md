@@ -61,12 +61,14 @@ simply ignore the extra keys.
 When a capture's `payload.login` carries `{ username, password }`, `login-fill.js`
 is injected once the login tab lands on the platform's own login page (host +
 path match) and fills the username + password inputs — using each platform's
-selectors for Lazada and Shopee, and a defensive single-visible-match fallback
-for TikTok. It only **fills**: it never submits the form, and the operator still
-completes login (and OTP/2FA) by hand. Values are never logged. `login` is wiped
-from the tab's stored capture context as soon as a fill sets a field, or after at
-most two attempts if nothing matched — so it never lingers. Omit `login` and the
-extension behaves exactly as before.
+selectors for Lazada and Shopee, and a broadened, defensive single-visible-match
+fallback for TikTok (v2.6.1: matches on `type`, `name`, `placeholder`, and
+`autocomplete` tokens for the username/email field; the password field stays
+`type="password"` only, never broadened). It only **fills**: it never submits
+the form, and the operator still completes login (and OTP/2FA) by hand. Values
+are never logged. `login` is wiped from the tab's stored capture context as soon
+as a fill sets a field, or after at most two attempts if nothing matched — so it
+never lingers. Omit `login` and the extension behaves exactly as before.
 
 ---
 
@@ -154,8 +156,11 @@ token minted by the backend's Sessions page.
 | `tabs` | Open and track the login tab |
 | `activeTab` | Capture the current tab from the popup |
 | `storage` | Persist the popup's backend URL + per-tab capture context |
-| `browsingData` | Clear localStorage/IndexedDB/Service Workers/Cache Storage/cache for the platform's known origins before a bridge-flow login tab opens (v2.6.0 fresh-login hard guard) |
 | host: `*.shopee.ph`, `*.shopee.com`, `*.lazada.com.ph`, `*.lazada.com`, `*.tiktok.com`, `*.tiktokshop.com` | Scoped to the three platforms — never `<all_urls>` |
+
+`browsingData` was requested in `2.6.0` (to clear localStorage/IndexedDB/Service
+Workers/Cache Storage/cache before a bridge-flow login tab opens) and **removed
+in `2.6.1`** — see the changelog below for why.
 
 `bridge.js` runs only on the listed frontend origins, so no other site can drive
 the extension.
@@ -169,6 +174,44 @@ Broad registrable domains (matched with all subdomains):
 - **TikTok:** `tiktok.com`, `tiktokshop.com`
 
 ## Versioning
+
+`2.6.1` — two fixes:
+
+- **Pre-capture wipe scoped back to cookies-only.** `2.6.0`'s pre-login hard
+  guard wiped cookies AND site storage/cache (localStorage, IndexedDB, Service
+  Workers, Cache Storage, the HTTP cache — `wipePlatformSiteData()`, plus a
+  one-shot in-tab `localStorage`/`sessionStorage` clear) before every login tab
+  opened. That broke fresh logins instead of protecting them: Shopee and
+  TikTok use browser site-storage state as part of their DEVICE-TRUST
+  fingerprint, so wiping it made every fresh login look like a brand-new,
+  untrusted device — Shopee force-logged the operator back out right after
+  login succeeded, and TikTok showed a "Browser invalid" wall. Confirmed by
+  direct comparison: a Shopee capture succeeded under `2.5.0` (cookie wipes
+  only) and died shortly after under `2.6.0` (cookie + site-storage wipes),
+  with no other change in between. Cookies alone carry the login state on all
+  three platforms, so the guard is scoped back to cookies-only —
+  `removeCookiesForPlatform()`, same as `2.5.0`'s post-capture hygiene. It is
+  still **unconditional** and still runs before the login tab opens; only its
+  blast radius shrank. `wipePlatformSiteData`, `siteDataOriginsForPlatform`,
+  `clearTabStorage`, and the `browsingData` permission are removed — nothing
+  else used them.
+- **TikTok seller-login auto-fill broadened.** A real capture showed TikTok
+  Seller Center's login form (`seller-ph.tiktok.com` redirecting to TikTok's
+  own account-login page) never got filled. Two contributing fixes:
+  (1) `LOGIN_PAGE_PATTERNS.TIKTOK` in `background.js` previously only matched
+  the `seller(-ph).tiktok.com` host itself — the redirect target lands on a
+  different `*.tiktok.com` host, which the pattern never matched, so the fill
+  never fired at all; it's now broadened to any `*.tiktok.com` host (still
+  gated on a login-shaped path). (2) `login-fill.js`'s TikTok username
+  selector was a plain `type="text"`/`type="email"` match; it's now broadened
+  to also match on `name`/`placeholder`/`autocomplete` tokens plausible for an
+  email/username field (`email`, `account`, `loginName`, `username`, `phone`).
+  The password selector is **unchanged** — `type="password"` only, never
+  broadened or weakened — and the single-visible-match guard (skip rather than
+  guess on 0 or >1 matches) still applies to every alternative. TikTok's actual
+  login-page host and DOM could not be confirmed against a live page while
+  making this fix; see the extension repo's task report for what remains
+  unverified.
 
 `2.6.0` — fresh-capture hard guard (pre-login wipe): the bridge flow's
 `startCapture()` — the flow that opens a NEW platform login tab, never the

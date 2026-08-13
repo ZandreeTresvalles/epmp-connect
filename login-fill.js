@@ -36,6 +36,55 @@
  * @param {'LAZADA'|'SHOPEE'|'TIKTOK'} platform
  * @returns {{ usernameEl: object|null, passwordEl: object|null }}
  */
+// Per-platform field selectors. A plain `function` (not a top-level `const`),
+// deliberately, per this file's re-injection gotcha above — it's cheap to
+// rebuild on every call and stays safe to redeclare on repeat injection.
+// Exported for tests too (see the `module.exports` guard at the bottom), so
+// login-fill.test.js can assert against the exact selector strings rather
+// than duplicating them.
+//
+// LAZADA / SHOPEE selectors below are verified against the real seller login
+// forms. TIKTOK still has no confirmed stable selector — a real capture
+// (2026-08-13) showed the seller login form did NOT get auto-filled, and its
+// login page was not directly inspectable while broadening this list (see
+// the v2.6.1 task report's flagged concern). Rather than one plain
+// input-type match, TIKTOK's selector is broadened to also match on
+// name/placeholder/autocomplete tokens TikTok's account-login page plausibly
+// uses for its email/username field — 'email', 'account', 'loginName',
+// 'username', 'phone' — on top of type="text"/type="email". This is
+// heuristic broadening, not a confirmed selector: it leans entirely on the
+// single-visible-match guard below. If the real page ever renders more than
+// one visible match across all of these (or none), the username field is
+// still skipped rather than guessed. The password selector is deliberately
+// UNCHANGED — type="password" is the one signal that's never ambiguous, so
+// it is never broadened or weakened.
+function buildLoginSelectors() {
+  return {
+    LAZADA: { username: 'input#account', password: 'input[type="password"]' },
+    SHOPEE: {
+      username: 'input.shopee-input__input[type="text"]',
+      password: 'input.shopee-input__input[type="password"]',
+    },
+    TIKTOK: {
+      username: [
+        'input[type="text"]',
+        'input[type="email"]',
+        'input[name*="email" i]',
+        'input[name*="account" i]',
+        'input[name*="loginName" i]',
+        'input[name*="username" i]',
+        'input[name*="phone" i]',
+        'input[placeholder*="email" i]',
+        'input[placeholder*="phone" i]',
+        'input[placeholder*="username" i]',
+        'input[autocomplete="username"]',
+        'input[autocomplete="email"]',
+      ].join(', '),
+      password: 'input[type="password"]',
+    },
+  };
+}
+
 function pickLoginFields(doc, platform) {
   function isVisible(el) {
     if (!el) return false;
@@ -60,26 +109,7 @@ function pickLoginFields(doc, platform) {
     return all.length === 1 ? all[0] : null; // 0 or >1 visible matches: never guess.
   }
 
-  // LAZADA / SHOPEE selectors below are verified against the real seller login
-  // forms. TIKTOK has no confirmed stable selector (its Seller Center login
-  // form was not directly inspectable while building this), so it falls back
-  // to generic input-type matching and leans entirely on the single-visible-
-  // match guard above: if that page ever renders more than one visible
-  // text/email input (or none), the username field is skipped rather than
-  // guessed.
-  const SELECTORS = {
-    LAZADA: { username: 'input#account', password: 'input[type="password"]' },
-    SHOPEE: {
-      username: 'input.shopee-input__input[type="text"]',
-      password: 'input.shopee-input__input[type="password"]',
-    },
-    TIKTOK: {
-      username: 'input[type="text"], input[type="email"]',
-      password: 'input[type="password"]',
-    },
-  };
-
-  const sel = SELECTORS[platform];
+  const sel = buildLoginSelectors()[platform];
   if (!sel) return { usernameEl: null, passwordEl: null };
   return { usernameEl: pickSingle(sel.username), passwordEl: pickSingle(sel.password) };
 }
@@ -132,5 +162,5 @@ if (typeof window !== 'undefined') {
 // exists in the browser's isolated-world content-script context, so this is
 // dead code there — the guard just keeps it from throwing if it ever did.
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { pickLoginFields, setNativeInputValue };
+  module.exports = { pickLoginFields, setNativeInputValue, buildLoginSelectors };
 }
