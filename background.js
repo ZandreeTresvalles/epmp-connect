@@ -20,6 +20,25 @@
  * with Authorization: Bearer <token>, body { storageState, ...optional }.
  */
 
+// page-state.js is THE canonical answer to "what kind of page is this?" —
+// login form / dashboard / still-authenticating / genuinely authenticated
+// content. Loaded first so every predicate below resolves from it. A classic
+// script (no ES export) precisely so the same file also injects into a page
+// and require()s under node --test. See its header for the CANONICAL AUTH
+// SPEC mirrored in the worker + box.
+// node --test: importScripts doesn't exist there, and there is no global
+// `self` — alias it to globalThis (page-state.js's own node guard populates
+// self.EpmpPageState, exactly like it populates the real `self` in the
+// service-worker realm) before pulling the file in via require(). Dead code
+// in the browser: `importScripts` always exists in a service worker, so the
+// `else` branch never runs there.
+if (typeof importScripts === 'function') {
+  importScripts('page-state.js');
+} else if (typeof require !== 'undefined') {
+  globalThis.self = globalThis.self || globalThis;
+  require('./page-state.js');
+}
+
 // ── Platform config ──────────────────────────────────────────────────────────
 // Cookie domains are the broad registrable domains. chrome.cookies.getAll({domain})
 // matches the domain AND all subdomains, so these cover seller.*, subaccount.*,
@@ -32,108 +51,42 @@ const PLATFORM_COOKIE_DOMAINS = {
 
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// ── Dashboard auto-detection ─────────────────────────────────────────────────
-// Predecessor extensions deliberately required a manual "Capture Session"
-// click because multi-step 2FA makes auto-detecting "login complete"
-// unreliable. This trades that safety margin for a hands-off flow: a false
-// positive just fails harmlessly ("No cookies found"), and the banner's
-// manual button stays available as a fallback if auto-detection never fires.
-//
-// Detection doctrine (mirrors what each backend's own scraper treats as
-// "logged in"): a seller lands authenticated on the Seller Center HOST but the
-// post-login landing PATH varies per account (Shopee → /portal/home,
-// /portal/sale/order, /datacenter/…; TikTok → /order, /compass/*, /homepage,
-// etc.). The scrapers therefore never match a specific dashboard path — they
-// treat the session as valid whenever the URL is on the seller-center host and
-// is NOT a login/auth page. We use the same test here so auto-capture fires on
-// ANY authenticated landing page, not just one hand-picked route.
-//   - encoder-reports shopeeApi.ts: logged-in ⇔ url.startsWith('https://seller.shopee.ph')
-//   - encoder-reports tiktok.ts / tiktokApi.ts: logged-out ⇔ url includes
-//     /account/login | /passport/ | /sign-in | login
-//   - encoder-reports lazadaApi.ts / lazada.ts: logged-out ⇔ url includes /login | /signin
-//   - audit-reports shopeeInventory.ts / tiktokInventory.ts: logged-out ⇔ url
-//     includes /login | /sign-in | /passport
-// AUTH_PATH is the union of those login/2FA/verification path fragments; a URL
-// that matches it is treated as "still logging in" and auto-capture is held off.
-const AUTH_PATH = /(\/(login|signin|sign-in|passport|account\/login|verify|verification|2fa|otp|captcha))/i;
-
-const DASHBOARD_PATTERNS = {
-  LAZADA: (u) => /(^|\.)sellercenter\.lazada\.com\.ph$/.test(u.hostname)
-    && !AUTH_PATH.test(u.pathname),
-  SHOPEE: (u) => /(^|\.)seller\.shopee\.ph$/.test(u.hostname)
-    && !AUTH_PATH.test(u.pathname),
-  TIKTOK: (u) => /(^|\.)seller(-ph)?\.tiktok\.com$/.test(u.hostname)
-    && !AUTH_PATH.test(u.pathname),
+// ── Test-only timing seam ────────────────────────────────────────────────────
+// Every value here is a real production default — unchanged from whatever
+// each feature shipped with (see the comments at each call site for why that
+// particular number). They live on one mutable object, instead of as
+// standalone consts, ONLY so capture-flow.test.js can shrink them before
+// driving a flow that would otherwise really wait: hasAuthenticatedContent's
+// 8s timeout, runDiscovery's up-to-30s poll loop, the 1.5s cookie-settle
+// retry, the 1.7s post-capture hygiene pause. node --test must stay hermetic
+// (no real multi-second waits) — nothing in the browser ever mutates this
+// object, so the production path always runs with these exact defaults.
+const TEST_TIMEOUTS = {
+  AUTH_CONTENT_POLL_INTERVAL_MS: 500,
+  AUTH_CONTENT_TIMEOUT_MS: 8000,
+  AUTO_CAPTURE_SETTLE_MS: 1500,
+  POST_CAPTURE_HYGIENE_DELAY_MS: 1700,
+  DISCOVERY_POLL_INTERVAL_MS: 2500,
+  DISCOVERY_MAX_ITERATIONS: 12,
 };
 
-function looksLikeDashboard(platform, urlStr) {
-  try {
-    const check = DASHBOARD_PATTERNS[platform];
-    return !!check && check(new URL(urlStr));
-  } catch {
-    return false;
-  }
-}
+// ── Page-state predicates → page-state.js ───────────────────────────────────
+// The four questions this file used to answer inline — AUTH_PATH,
+// DASHBOARD_PATTERNS, LOGIN_PATH, LOGIN_PAGE_PATTERNS — plus the positive
+// authenticated-content check the capture guard needs, now live in ONE
+// canonical module. Answering them in several places, each slightly
+// different, is exactly what produced five point-fix releases in two days
+// (see page-state.js's header). Never re-define them here.
+const {
+  isAuthPath,
+  isLoginPage,
+  isDashboardUrl,
+  AUTHENTICATED_CONTENT_SELECTOR,
+} = self.EpmpPageState;
 
-// ── Login-page detection (seller-login auto-fill, v2.3.0) ───────────────────
-// The opposite check from DASHBOARD_PATTERNS above: that asserts an
-// authenticated page that ISN'T on AUTH_PATH; this asserts we're actually ON
-// the login form itself, so it's safe (and useful) to fill it. LOGIN_PATH is
-// deliberately a NARROWER subset of AUTH_PATH — login/signin/passport
-// fragments only, excluding verify/2fa/otp/captcha, which are post-username
-// steps where a username/password form doesn't exist.
-//
-// SHOPEE is a special case: sellers added to a brand log in through a
-// dedicated sub-account portal host (`subaccount.shopee.com`, per EPMP's
-// LOGIN_URLS), distinct from the `seller.shopee.ph` dashboard host, whose
-// landing path IS the login form — there's no separate /login suffix to
-// match. That root-path assumption is the one part of this file that
-// couldn't be confirmed against the live page while building this feature;
-// see the extension repo's task report for the flagged concern.
-//
-// TIKTOK is ALSO a special case (v2.6.1): a real capture showed the seller
-// login form never gets filled, and the seller-center host
-// (`seller(-ph).tiktok.com`) redirects to TikTok's own account-login page on
-// a different host before that form ever mounts. The original hostname check
-// here only matched the seller-center host itself, so once the redirect
-// landed, this pattern stopped matching and the fill never fired — a URL
-// gate silently excluding the very page it needed to match. Broadened to any
-// `*.tiktok.com` host (still gated on LOGIN_PATH, so it only fires on a
-// login-shaped path, never on the feed/dashboard); manifest.json's
-// `*.tiktok.com` host permission already covers scripting injection into
-// whichever host that turns out to be. Which exact host TikTok redirects to,
-// and that host's DOM, could not be confirmed against a live page while
-// making this fix — flagged as unverifiable in the task report.
-const LOGIN_PATH = /(\/(login|signin|sign-in|passport|account\/login))/i;
-
-const LOGIN_PAGE_PATTERNS = {
-  LAZADA: (u) => /(^|\.)sellercenter\.lazada\.com\.ph$/.test(u.hostname) && LOGIN_PATH.test(u.pathname),
-  // Two Shopee login surfaces, both real (probed live 2026-08-13):
-  //   subaccount.shopee.com/login/           — the Sub-account Platform form
-  //   account.seller.shopee.com/signin/…     — the unified "Main / Sub Account
-  //                                            Login" OAuth form, which Shopee
-  //                                            mints (freshly SIGNED) when the
-  //                                            "Login with Main/Sub Account"
-  //                                            button on accounts.shopee.ph is
-  //                                            clicked — see
-  //                                            clickShopeeMainSubLogin below.
-  // Both render `input.shopee-input__input` text+password fields, which is
-  // exactly what login-fill.js's SHOPEE selector already targets, so allowing
-  // the second host here is all autofill needs to work on the OAuth form.
-  SHOPEE: (u) => (/(^|\.)subaccount\.shopee\.com$/.test(u.hostname)
-      && (u.pathname === '/' || LOGIN_PATH.test(u.pathname)))
-    || (/(^|\.)account\.seller\.shopee\.com$/.test(u.hostname) && LOGIN_PATH.test(u.pathname)),
-  TIKTOK: (u) => /(^|\.)tiktok\.com$/.test(u.hostname) && LOGIN_PATH.test(u.pathname),
-};
-
-function looksLikeLoginPage(platform, urlStr) {
-  try {
-    const check = LOGIN_PAGE_PATTERNS[platform];
-    return !!check && check(new URL(urlStr));
-  } catch {
-    return false;
-  }
-}
+// Aliases so the existing call sites below keep reading naturally.
+const looksLikeDashboard = isDashboardUrl;
+const looksLikeLoginPage = isLoginPage;
 
 // ── Upload URL normalization ─────────────────────────────────────────────────
 // Callers give us one of: a bare origin (https://host), a base ending in /api,
@@ -388,7 +341,7 @@ async function runPostCaptureHygiene(tabId, ctx) {
   // Brief — the flow should still feel fast. showBannerState already
   // swallows a failure (tab already gone/navigated) via its own try/catch.
   await showBannerState(tabId, platform, 'success', message).catch(() => {});
-  await delay(1700);
+  await delay(TEST_TIMEOUTS.POST_CAPTURE_HYGIENE_DELAY_MS);
 
   try {
     const { removed, failed } = await removeCookiesForPlatform(platform);
@@ -585,9 +538,13 @@ async function runDiscovery(tabId, productListUrl, onProgress) {
   if (!productListUrl) return { endpointStatus: null };
   try {
     await chrome.tabs.update(tabId, { url: productListUrl });
-    for (let i = 0; i < 12; i++) {
-      await delay(2500);
-      if (onProgress) { try { await onProgress(Math.round(((i + 1) * 2500) / 1000)); } catch { /* feedback only */ } }
+    for (let i = 0; i < TEST_TIMEOUTS.DISCOVERY_MAX_ITERATIONS; i++) {
+      await delay(TEST_TIMEOUTS.DISCOVERY_POLL_INTERVAL_MS);
+      if (onProgress) {
+        try {
+          await onProgress(Math.round(((i + 1) * TEST_TIMEOUTS.DISCOVERY_POLL_INTERVAL_MS) / 1000));
+        } catch { /* feedback only */ }
+      }
       const [res] = await chrome.scripting.executeScript({
         target: { tabId },
         world: 'MAIN',
@@ -611,6 +568,46 @@ async function runDiscovery(tabId, productListUrl, onProgress) {
     return { endpointStatus: 'unverified' };
   } catch {
     return { endpointStatus: 'unverified' };
+  }
+}
+
+// ── Positive authentication proof (v2.7.0) ──────────────────────────────────
+// Asks the TAB whether a signed-in Seller Center shell actually rendered,
+// using page-state.js's ANY-VISIBLE rule — the same SPEC the worker grades
+// live sessions with, so "authenticated" means one thing across the capture
+// path and the heartbeat that later validates what we captured.
+//
+// Polls rather than asking once: these Seller Centers are JS-rendered SPAs, so
+// the shell mounts well after the tab reports "complete" (Shopee's Main/Sub
+// OAuth form needed ~9s in a live probe). Asking once is precisely the bug
+// that made autofill silently no-op for every brand — see fillWhenReady in
+// login-fill.js. Bounded, and never throws: a false return means "could not
+// prove it", which the caller treats as not-authenticated.
+async function hasAuthenticatedContent(tabId, opts) {
+  const o = opts || {};
+  const intervalMs = o.intervalMs || TEST_TIMEOUTS.AUTH_CONTENT_POLL_INTERVAL_MS;
+  const timeoutMs = o.timeoutMs || TEST_TIMEOUTS.AUTH_CONTENT_TIMEOUT_MS;
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      // Re-injected each tick on purpose: it is idempotent (the file only
+      // redefines the same function) and a navigation mid-poll wipes the
+      // previous injection, which is exactly when we must not go blind.
+      await chrome.scripting.executeScript({ target: { tabId }, files: ['page-state.js'] });
+      const [res] = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: () => (typeof window.__epmpIsAuthenticatedContent === 'function'
+          ? window.__epmpIsAuthenticatedContent()
+          : false),
+      });
+      if (res && res.result === true) return true;
+    } catch {
+      // Tab navigating / CSP / not injectable yet — keep trying until the
+      // deadline rather than concluding "not authenticated" from one miss.
+    }
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return false;
+    await delay(Math.min(intervalMs, remaining));
   }
 }
 
@@ -673,30 +670,49 @@ async function captureFromTab(tabId, ctxOverride) {
     if (disc.sampleResponse) body.sampleResponse = disc.sampleResponse;
   }
 
-  // RC2 guard (2026-08-13): refuse to upload an UNAUTHENTICATED session.
-  // Shopee/Lazada set cookies even on their login/verification pages, so the
-  // `storageState.cookies.length` check above passes for a logged-OUT session
-  // — which is exactly how a capture whose login never completed (e.g. an OTP
-  // verification that failed) got uploaded, then bounced straight to
-  // `accounts.shopee.ph/seller/login` on its first heartbeat and read as
-  // "expired within the same minute" (ArlaPH SHOPEE, 2026-08-13). If a
-  // productListUrl was set, runDiscovery just navigated the tab there; a dead
-  // session redirects that navigation to a login/verification URL, so the
-  // tab's CURRENT url is the authoritative "are we actually logged in" signal.
-  // AUTH_PATH is the union of login/signin/passport/verify/otp/captcha
-  // fragments already defined for auto-capture detection. Fail BEFORE the
-  // upload and BEFORE post-capture hygiene, so nothing is persisted and no
-  // cookies are wiped — the operator finishes logging in and retries.
+  // ── Positive-proof authentication gate ─────────────────────────────────────
+  // A capture may only be uploaded on POSITIVE evidence that the operator is
+  // logged in. v2.6.2 shipped the first half of this (refuse when the URL is a
+  // login/verification page) after a failed-OTP capture uploaded a logged-OUT
+  // session that died on its first heartbeat (ArlaPH SHOPEE, 2026-08-13) —
+  // `storageState.cookies.length > 0` passes for a logged-out page, because
+  // Shopee/Lazada set cookies on their login pages too.
+  //
+  // But "the URL isn't a login page" is the ABSENCE of bad news, not evidence
+  // of good news: a captcha wall, an interstitial, an error page or a
+  // half-rendered shell all pass it. So the gate now requires one of two
+  // POSITIVE signals, mirroring what the worker's heartbeat demands of a live
+  // session:
+  //   (a) discovery actually completed an authenticated product-API call
+  //       (`endpointStatus === 'discovered'`) — the strongest possible proof,
+  //       already computed above and, until now, thrown away by this guard; or
+  //   (b) an authenticated-content marker is visible in the tab
+  //       (page-state.js's ANY-VISIBLE rule, the same SPEC the worker grades
+  //       sessions with).
+  // Refuse only when BOTH are absent — a genuinely logged-in capture whose
+  // product endpoint is merely slow still passes on (b), so this hardens the
+  // gate without introducing false refusals.
+  //
+  // Fails BEFORE the upload and BEFORE post-capture hygiene, so nothing is
+  // persisted and no cookies are wiped: the operator finishes logging in and
+  // retries on the same tab.
   const liveTab = await chrome.tabs.get(tabId).catch(() => null);
   const liveUrl = (liveTab && liveTab.url) || '';
-  if (AUTH_PATH.test(liveUrl)) {
+  const authedByDiscovery = body.endpointStatus === 'discovered';
+  const authedByContent = authedByDiscovery ? false : await hasAuthenticatedContent(tabId);
+  if (!authedByDiscovery && !authedByContent) {
+    const onLoginUrl = isAuthPath(liveUrl);
     showBannerState(
       tabId, ctx.platform, 'error',
-      `Not logged in yet — the ${PLATFORM_LABELS[ctx.platform] || ctx.platform} page is still on a login/verification screen. Finish logging in (including any OTP), then capture again.`,
+      onLoginUrl
+        ? `Not logged in yet — the ${PLATFORM_LABELS[ctx.platform] || ctx.platform} page is still on a login/verification screen. Finish logging in (including any OTP), then capture again.`
+        : `Couldn't confirm you're logged in to ${PLATFORM_LABELS[ctx.platform] || ctx.platform} — the page didn't load a signed-in Seller Center. Finish logging in (or reload the Seller Center), then capture again.`,
     );
     return {
       ok: false,
-      error: `Session not authenticated — the page is on a login/verification URL (${liveUrl.slice(0, 80)}). Complete login, then re-capture.`,
+      error: onLoginUrl
+        ? `Session not authenticated — the page is on a login/verification URL (${liveUrl.slice(0, 80)}). Complete login, then re-capture.`
+        : `Session not authenticated — no authenticated Seller Center content and no product endpoint at ${liveUrl.slice(0, 80)}. Complete login, then re-capture.`,
     };
   }
 
@@ -811,10 +827,9 @@ async function startCapture(payload, originTabId) {
 // covers it. Any other error (bad token, unsupported platform, upload HTTP
 // failure) is not retried; we mark the tab attempted and fall back to the
 // manual banner button.
-const AUTO_CAPTURE_SETTLE_MS = 1500;
 const NO_COOKIES_RE = /no cookies found/i;
 
-chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
+async function handleTabsOnUpdated(tabId, info, tab) {
   if (info.status !== 'complete') return;
   let ctx = await getContext(tabId);
   if (!ctx) return;
@@ -859,12 +874,30 @@ chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
   // discovery's own navigation fires reads the flag and bails.
   await setContext(tabId, { ...ctx, autoCaptureInFlight: true });
 
+  // Readiness gate (v2.7.0): a matching dashboard URL only says the browser
+  // ARRIVED somewhere authenticated-looking — not that a signed-in shell
+  // rendered. Firing on the URL alone starts a capture against a blank or
+  // still-mounting SPA, which then has to be refused downstream. Waiting for
+  // the same authenticated-content marker the capture gate (and the worker's
+  // heartbeat) uses turns auto-capture into "fire when the page is actually
+  // ready", the wait-for-condition rule this whole release is built on.
+  //
+  // The slot is claimed FIRST and released here on a miss: the re-entrancy
+  // guard above must never be preceded by an await, and `autoCaptureAttempted`
+  // is deliberately NOT set — an unready page hasn't had its one attempt yet,
+  // so a later 'complete' (or the banner's manual button) can still capture.
+  if (!(await hasAuthenticatedContent(tabId))) {
+    const stillThere = await getContext(tabId);
+    if (stillThere) await setContext(tabId, { ...stillThere, autoCaptureInFlight: false });
+    return;
+  }
+
   let result = await captureFromTab(tabId).catch((e) => ({ ok: false, error: String(e?.message || e) }));
 
   // One retry, only for the cookie-settle race — and only if the context is
   // still present (a concurrent success/tab-close would have cleared it).
   if (!result.ok && NO_COOKIES_RE.test(result.error || '')) {
-    await delay(AUTO_CAPTURE_SETTLE_MS);
+    await delay(TEST_TIMEOUTS.AUTO_CAPTURE_SETTLE_MS);
     if (await getContext(tabId)) {
       result = await captureFromTab(tabId).catch((e) => ({ ok: false, error: String(e?.message || e) }));
     }
@@ -893,12 +926,14 @@ chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
       `Auto-capture did not complete: ${result.error || 'unknown error'}. Log in fully, then click Capture Session.`,
     );
   }
-});
+}
+chrome.tabs.onUpdated.addListener(handleTabsOnUpdated);
 
-chrome.tabs.onRemoved.addListener((tabId) => { clearContext(tabId); });
+function handleTabsOnRemoved(tabId) { clearContext(tabId); }
+chrome.tabs.onRemoved.addListener(handleTabsOnRemoved);
 
 // ── Message router — speaks BOTH the ReportBot and EPMP dialects ─────────────
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+function handleRuntimeMessage(msg, sender, sendResponse) {
   const type = msg?.type;
 
   // Liveness ping (both dialects: 'ping' / 'PING').
@@ -997,4 +1032,36 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   return false;
-});
+}
+chrome.runtime.onMessage.addListener(handleRuntimeMessage);
+
+// node --test entry point (mirrors login-fill.js's own guard at the bottom of
+// that file). `module` never exists in the service-worker/browser realm, so
+// this whole block is dead code there — it only runs under require(). Export
+// surface for capture-flow.test.js: the capture pipeline itself
+// (captureFromTab/runDiscovery/hasAuthenticatedContent/startCapture), the
+// Shopee Main/Sub helpers, the storage.session helpers so tests can seed/read
+// per-tab context the same way the real flow does, the three top-level
+// listener callbacks (so tests can drive onUpdated/onRemoved/onMessage
+// directly instead of only their DI fakes' addListener capture), and
+// TEST_TIMEOUTS so a test can shrink real production delays/polls to a few ms
+// before driving a flow. Nothing about these functions' behavior changes
+// between the browser and node --test.
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = {
+    captureFromTab,
+    hasAuthenticatedContent,
+    runDiscovery,
+    startCapture,
+    clickShopeeMainSubLogin,
+    isShopeeMainLoginPage,
+    removeCookiesForPlatform,
+    handleTabsOnUpdated,
+    handleTabsOnRemoved,
+    handleRuntimeMessage,
+    getContext,
+    setContext,
+    clearContext,
+    TEST_TIMEOUTS,
+  };
+}

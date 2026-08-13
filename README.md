@@ -175,6 +175,31 @@ Broad registrable domains (matched with all subdomains):
 
 ## Versioning
 
+`2.7.0` — **capture now requires POSITIVE proof of authentication, and page
+state is answered in exactly one place.** Five releases in two days
+(2.5.0→2.6.4) each patched a symptom of one root problem: "is this an
+authenticated Seller Center?" was answered four different weak ways in this
+file alone (`AUTH_PATH`, `LOGIN_PAGE_PATTERNS`, `DASHBOARD_PATTERNS`, and the
+capture guard's URL test), none of them the POSITIVE content check the
+backend worker already used — so a capture whose login had failed uploaded a
+logged-out session, and the flow had no tests to catch it.
+- New `page-state.js` is the single canonical answer (login form / dashboard /
+  still-authenticating / genuinely-authenticated content). It carries the
+  CANONICAL AUTH SPEC mirrored in the backend worker and the box, with a
+  parity test in the EPMP repo that fails if the three ever drift.
+- The capture gate no longer asks "is the URL not a login page?" (the absence
+  of bad news — a captcha wall, interstitial or half-rendered shell all pass
+  it). It uploads only on positive proof: discovery completed a real
+  authenticated product-API call, OR a signed-in Seller Center shell is
+  visibly rendered (ANY-VISIBLE rule). Refuses only when BOTH are absent, so
+  a slow product endpoint never causes a false refusal.
+- Auto-capture fires on READINESS, not on a URL match, so it can't start
+  against a still-mounting page.
+- The capture flow now has tests: `capture-harness.js` (DI fakes for
+  chrome.tabs/scripting/cookies/storage + fetch) and `capture-flow.test.js` +
+  `page-state.test.js` — 46 assertions covering a regression case for each of
+  the 2.5.0→2.6.4 bugs.
+
 `2.6.4` — **autofill now waits for the login form to render.** Every one of
 these login pages is a JS-rendered SPA, but the fill ran exactly once, on the
 tab's `complete` event — which fires when the *document* finishes loading,
